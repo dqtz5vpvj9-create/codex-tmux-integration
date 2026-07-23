@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{BIN_DIR}}/agent-tmux-notify",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{BIN_DIR}}/agent-tmux-notify",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

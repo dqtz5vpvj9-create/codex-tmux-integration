@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Bounded binary sink for one tmux pipe-pane stream."""
+
+import os
+import sys
+from pathlib import Path
+
+DEFAULT_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_BACKUPS = 3
+CHUNK_SIZE = 64 * 1024
+
+
+def positive_int(name, default):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def rotate(path, backups):
+    try:
+        oldest = path.with_name(f"{path.name}.{backups}")
+        oldest.unlink(missing_ok=True)
+        for index in range(backups - 1, 0, -1):
+            source = path.with_name(f"{path.name}.{index}")
+            if source.exists():
+                source.replace(path.with_name(f"{path.name}.{index + 1}"))
+        if path.exists():
+            path.replace(path.with_name(f"{path.name}.1"))
+    except OSError:
+        pass
+
+
+def main():
+    if len(sys.argv) != 2:
+        return 2
+    path = Path(sys.argv[1]).expanduser()
+    max_bytes = positive_int("TMUX_PANE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES)
+    backups = positive_int("TMUX_PANE_LOG_BACKUPS", DEFAULT_BACKUPS)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        return 1
+
+    input_fd = sys.stdin.fileno()
+    handle = None
+    size = 0
+    try:
+        while True:
+            # os.read returns the bytes currently available from pipe-pane;
+            # BufferedReader.read(size) may wait for a full 64 KiB buffer.
+            chunk = os.read(input_fd, CHUNK_SIZE)
+            if not chunk:
+                break
+            if handle is None:
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+                if size and size + len(chunk) > max_bytes:
+                    rotate(path, backups)
+                    size = 0
+                handle = path.open("ab", buffering=0)
+                os.chmod(path, 0o600)
+            elif size and size + len(chunk) > max_bytes:
+                handle.close()
+                rotate(path, backups)
+                handle = path.open("ab", buffering=0)
+                os.chmod(path, 0o600)
+                size = 0
+            handle.write(chunk)
+            size += len(chunk)
+    except (BrokenPipeError, OSError):
+        return 1
+    finally:
+        if handle is not None:
+            handle.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

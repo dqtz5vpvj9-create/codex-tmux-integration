@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{BIN_DIR}}/codex-tmux-title-sync",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{BIN_DIR}}/codex-tmux-title-sync",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{BIN_DIR}}/codex-tmux-title-sync",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

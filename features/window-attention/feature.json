@@ -1,0 +1,14 @@
+{
+  "name": "window-attention",
+  "description": "Highlight an inactive tmux window when an agent stops or needs input.",
+  "dependencies": ["tmux-context"],
+  "binaries": [
+    {"source": "bin/agent-tmux-notify", "name": "agent-tmux-notify"}
+  ],
+  "tmux": ["tmux/clear-attention.conf"],
+  "shell": [],
+  "hooks": {
+    "codex": ["hooks/codex.json"],
+    "claude": ["hooks/claude.json"]
+  }
+}

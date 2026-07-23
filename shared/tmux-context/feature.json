@@ -1,0 +1,12 @@
+{
+  "name": "tmux-context",
+  "description": "Shared resolver for mapping agent hooks to a tmux socket and pane.",
+  "dependencies": [],
+  "binaries": [],
+  "tmux": [],
+  "shell": [],
+  "hooks": {
+    "codex": [],
+    "claude": []
+  }
+}

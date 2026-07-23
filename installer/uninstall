@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Remove selected codex-tmux-integration features without touching other config."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+from merge_hooks import apply_fragments, atomic_write_json, hooks_diff, load_json
+
+
+def load_install_module():
+    path = Path(__file__).resolve().with_name("install")
+    loader = importlib.machinery.SourceFileLoader("codex_tmux_installer", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise RuntimeError("could not load installer module")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--features",
+        help="comma-separated features to remove; defaults to all installed features",
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--home", type=Path, default=Path.home())
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    install = load_install_module()
+    home = args.home.expanduser().resolve()
+    state_root = home / ".local" / "state" / "codex-tmux-integration"
+    state_path = state_root / "state.json"
+    if not state_path.exists():
+        print("not installed")
+        return 0
+
+    state = load_json(state_path)
+    repo_root = Path(state["repo_root"]).resolve()
+    installed = list(state.get("enabled_features", []))
+    if args.features:
+        requested = [item.strip() for item in args.features.split(",") if item.strip()]
+        unknown = sorted(set(requested) - set(installed))
+        if unknown:
+            raise ValueError(f"features are not installed: {', '.join(unknown)}")
+        removed = [name for name in installed if name in requested]
+    else:
+        removed = installed
+    remaining = [name for name in installed if name not in removed]
+
+    installed_manifests = [install.load_manifest(repo_root, name) for name in installed]
+    remaining_manifests = [install.load_manifest(repo_root, name) for name in remaining]
+    bin_dir = home / ".local" / "bin"
+    config_root = home / ".config" / "codex-tmux-integration"
+    tmux_aggregate = config_root / "tmux.conf"
+    shell_aggregate = config_root / "shell.zsh"
+    tmux_main = home / ".tmux.conf"
+    zsh_main = home / ".zshrc"
+    codex_hooks = home / ".codex" / "hooks.json"
+    claude_settings = home / ".claude" / "settings.json"
+
+    installed_links = {
+        Path(target): Path(source)
+        for target, source in state.get("links", {}).items()
+    }
+    remaining_links = install.add_shared_compatibility_links(
+        install.desired_links(remaining_manifests, bin_dir),
+        remaining,
+        repo_root,
+        bin_dir,
+    )
+    removed_links = {
+        target: source
+        for target, source in installed_links.items()
+        if target not in remaining_links
+    }
+
+    tmux_text, shell_text = install.desired_aggregators(remaining_manifests)
+    has_tmux = any(manifest.get("tmux") for _, manifest in remaining_manifests)
+    has_shell = any(manifest.get("shell") for _, manifest in remaining_manifests)
+    current_tmux_main = tmux_main.read_text(encoding="utf-8") if tmux_main.exists() else ""
+    current_zsh_main = zsh_main.read_text(encoding="utf-8") if zsh_main.exists() else ""
+    wanted_tmux_main = (
+        install.desired_tmux_main(current_tmux_main, tmux_aggregate)
+        if has_tmux
+        else install.strip_managed_block(current_tmux_main)
+    )
+    wanted_zsh_main = (
+        install.desired_zsh_main(current_zsh_main, shell_aggregate)
+        if has_shell
+        else install.strip_managed_block(current_zsh_main)
+    )
+
+    replacements = {"BIN_DIR": str(bin_dir), "REPO_ROOT": str(repo_root)}
+    codex_before = load_json(codex_hooks)
+    claude_before = load_json(claude_settings)
+    codex_after = apply_fragments(
+        codex_before,
+        install.collect_fragments(remaining_manifests, "codex"),
+        replacements,
+    )
+    claude_after = apply_fragments(
+        claude_before,
+        install.collect_fragments(remaining_manifests, "claude"),
+        replacements,
+    )
+
+    print(f"remove: {', '.join(removed) if removed else 'none'}")
+    print(f"remain: {', '.join(remaining) if remaining else 'none'}")
+    for target in removed_links:
+        print(f"  - unlink {target}")
+    if codex_before != codex_after:
+        print(hooks_diff(codex_before, codex_after, str(codex_hooks)))
+    if claude_before != claude_after:
+        print(hooks_diff(claude_before, claude_after, str(claude_settings)))
+    if args.dry_run:
+        return 0
+
+    stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%dT%H%M%S%z")
+    backup_root = state_root / "backups" / f"uninstall-{stamp}"
+    backup_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    install.backup_paths(
+        [
+            tmux_main,
+            zsh_main,
+            codex_hooks,
+            claude_settings,
+            tmux_aggregate,
+            shell_aggregate,
+            *removed_links.keys(),
+        ],
+        backup_root,
+        home,
+    )
+
+    for target, source in removed_links.items():
+        if target.is_symlink() and target.resolve() == source.resolve():
+            target.unlink()
+        elif target.exists() or target.is_symlink():
+            print(f"kept user-modified target: {target}")
+
+    if has_tmux:
+        install.atomic_write_text(tmux_aggregate, tmux_text)
+    else:
+        tmux_aggregate.unlink(missing_ok=True)
+    if has_shell:
+        install.atomic_write_text(shell_aggregate, shell_text)
+    else:
+        shell_aggregate.unlink(missing_ok=True)
+    install.atomic_write_text(tmux_main, wanted_tmux_main)
+    install.atomic_write_text(zsh_main, wanted_zsh_main)
+    atomic_write_json(codex_hooks, codex_after)
+    atomic_write_json(claude_settings, claude_after)
+
+    state["enabled_features"] = remaining
+    state["backup_root"] = str(backup_root)
+    state["installed_at"] = stamp
+    state["links"] = {
+        str(target): str(source) for target, source in remaining_links.items()
+    }
+    atomic_write_json(state_path, state)
+    print(f"backup: {backup_root}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

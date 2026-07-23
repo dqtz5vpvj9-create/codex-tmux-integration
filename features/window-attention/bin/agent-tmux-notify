@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Mark the tmux window owning a Codex/Claude hook as needing attention."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SHARED_CONTEXT = REPO_ROOT / "shared" / "tmux-context"
+if str(SHARED_CONTEXT) not in sys.path:
+    sys.path.insert(0, str(SHARED_CONTEXT))
+
+from agent_tmux_context import resolve_hook_target
+
+
+def tmux(socket, *args):
+    try:
+        result = subprocess.run(
+            ["tmux", "-S", socket, *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+
+    socket, pane = resolve_hook_target(payload, os.environ)
+    if not socket or not pane:
+        return 0
+
+    window_id = tmux(socket, "display-message", "-p", "-t", pane, "#{window_id}")
+    if not window_id:
+        return 0
+    active_clients = tmux(
+        socket, "display-message", "-p", "-t", window_id, "#{window_active_clients}"
+    )
+    try:
+        if int(active_clients or "0") > 0:
+            return 0
+    except ValueError:
+        pass
+
+    style = os.environ.get("AGENT_TMUX_NOTIFY_STYLE", "fg=black,bg=#d7af00,bold")
+    tmux(socket, "set-window-option", "-t", window_id, "window-status-style", style)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

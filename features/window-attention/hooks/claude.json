@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{BIN_DIR}}/agent-tmux-notify",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{BIN_DIR}}/agent-tmux-notify",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

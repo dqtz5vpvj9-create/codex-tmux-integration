@@ -1,0 +1,14 @@
+{
+  "name": "title-sync",
+  "description": "Keep a tmux window title aligned with its Codex session.",
+  "dependencies": ["tmux-context"],
+  "binaries": [
+    {"source": "bin/codex-tmux-title-sync", "name": "codex-tmux-title-sync"}
+  ],
+  "tmux": ["tmux/title-sync.conf"],
+  "shell": [],
+  "hooks": {
+    "codex": ["hooks/codex.json"],
+    "claude": []
+  }
+}

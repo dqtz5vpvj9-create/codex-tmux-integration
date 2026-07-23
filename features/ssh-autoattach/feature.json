@@ -1,0 +1,12 @@
+{
+  "name": "ssh-autoattach",
+  "description": "Safely select or create a tmux server/session on interactive SSH login.",
+  "dependencies": [],
+  "binaries": [],
+  "tmux": [],
+  "shell": ["shell/tmux-ssh.zsh"],
+  "hooks": {
+    "codex": [],
+    "claude": []
+  }
+}

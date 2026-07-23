@@ -1,0 +1,138 @@
+#!/bin/bash
+# Browse bounded logs written by tmux-autolog across every local tmux server.
+
+set -u
+
+LOGDIR="${TMUX_PANE_LOGDIR:-$HOME/.cache/tmux-pane-logs}"
+BASE="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+
+strip_ansi() {
+  sed -E '
+    s/\x1b\[[0-9;?]*[ -/]*[@-~]//g;
+    s/\x1b\][^\x07\x1b]*(\x07|\x1b\\)//g;
+    s/\x1b[()=>][AB012]?//g;
+    s/\r$//
+  '
+}
+
+server_key() {
+  local socket="$1" name hash
+  name=$(basename -- "$socket")
+  name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_')
+  hash=$(printf '%s' "$socket" | sha256sum | cut -c1-12)
+  printf '%s-%s\n' "${name:-default}" "$hash"
+}
+
+log_file() {
+  local socket="$1" pane="$2"
+  printf '%s/%s/%s.log\n' "$LOGDIR" "$(server_key "$socket")" "${pane#%}"
+}
+
+collect_sockets() {
+  find "$BASE" -maxdepth 1 -type s -print0 2>/dev/null
+}
+
+list_panes() {
+  printf '%-22s %-36s %-7s %-12s %-9s %s\n' SERVER WINDOW PANE COMMAND SIZE FILE
+  while IFS= read -r -d '' socket; do
+    local label
+    label=$(basename -- "$socket")
+    while IFS=$'\t' read -r wname pane cmd; do
+      [ -n "$pane" ] || continue
+      local file size
+      file=$(log_file "$socket" "$pane")
+      if [ -f "$file" ]; then
+        size=$(numfmt --to=iec-i --suffix=B "$(stat -c%s "$file")" 2>/dev/null)
+      else
+        size=-
+        file=-
+      fi
+      printf '%-22.22s %-36.36s %-7s %-12.12s %-9s %s\n' "$label" "$wname" "$pane" "$cmd" "$size" "$file"
+    done < <(tmux -S "$socket" list-panes -a -F '#{window_name}'$'\t''#{pane_id}'$'\t''#{pane_current_command}' 2>/dev/null)
+  done < <(collect_sockets)
+}
+
+resolve_query() {
+  local query="$1" requested_server="" requested_value="$query"
+  local -a match_sockets=() match_panes=()
+
+  if [[ "$query" == *:%* ]]; then
+    requested_server="${query%%:%*}"
+    requested_value="%${query#*:%}"
+  fi
+
+  while IFS= read -r -d '' socket; do
+    local label
+    label=$(basename -- "$socket")
+    [ -n "$requested_server" ] && [ "$requested_server" != "$label" ] && continue
+    if [ -z "$requested_server" ] && [[ "$requested_value" == %* ]] && [ -n "${TMUX:-}" ]; then
+      [ "$socket" != "${TMUX%%,*}" ] && continue
+    fi
+    while IFS=$'\t' read -r wname pane; do
+      [ -n "$pane" ] || continue
+      if { [[ "$requested_value" == %* ]] && [ "$pane" = "$requested_value" ]; } || \
+         { [[ "$requested_value" != %* ]] && [[ "$wname" == *"$requested_value"* ]]; }; then
+        match_sockets+=("$socket")
+        match_panes+=("$pane")
+      fi
+    done < <(tmux -S "$socket" list-panes -a -F '#{window_name}'$'\t''#{pane_id}' 2>/dev/null)
+  done < <(collect_sockets)
+
+  if [ "${#match_panes[@]}" -eq 0 ]; then
+    echo "no match for: $query" >&2
+    return 1
+  fi
+  if [ "${#match_panes[@]}" -gt 1 ]; then
+    echo "ambiguous match for '$query'; use server:%pane:" >&2
+    local i
+    for ((i=0; i<${#match_panes[@]}; i++)); do
+      printf '  %s:%s\n' "$(basename -- "${match_sockets[$i]}")" "${match_panes[$i]}" >&2
+    done
+    return 2
+  fi
+  RESOLVED_SOCKET="${match_sockets[0]}"
+  RESOLVED_PANE="${match_panes[0]}"
+}
+
+view_file() {
+  local file="$1" raw="$2" follow="$3"
+  if [ ! -f "$file" ]; then
+    echo "no log file: $file" >&2
+    return 1
+  fi
+  if [ "$follow" = 1 ]; then
+    if [ "$raw" = 1 ]; then tail -F "$file"; else tail -F "$file" | strip_ansi; fi
+  elif [ "$raw" = 1 ]; then
+    less -R +G "$file"
+  else
+    strip_ansi < "$file" | less +G
+  fi
+}
+
+raw=0
+follow=0
+query=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r|--raw) raw=1 ;;
+    -f|--follow) follow=1 ;;
+    -h|--help)
+      sed -n '2,2p' "$0" | sed 's/^# //'
+      printf 'usage: tlog [-r] [-f] [server:%%pane|%%pane|window-substring]\n'
+      exit 0
+      ;;
+    -l|--list) ;;
+    *) query="$1" ;;
+  esac
+  shift
+done
+
+if [ -z "$query" ]; then
+  list_panes
+  exit 0
+fi
+
+RESOLVED_SOCKET=""
+RESOLVED_PANE=""
+resolve_query "$query" || exit $?
+view_file "$(log_file "$RESOLVED_SOCKET" "$RESOLVED_PANE")" "$raw" "$follow"

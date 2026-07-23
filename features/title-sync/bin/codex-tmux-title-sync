@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Keep tmux window titles aligned with the Codex/Claude pane that owns them.
+
+Codex lifecycle hooks are handled from their JSON stdin and are intentionally
+scoped to the calling TMUX/TMUX_PANE.  Process scanning remains available only
+as a compatibility fallback for old panes that have not emitted a hook yet.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SHARED_CONTEXT = REPO_ROOT / "shared" / "tmux-context"
+if str(SHARED_CONTEXT) not in sys.path:
+    sys.path.insert(0, str(SHARED_CONTEXT))
+
+from agent_tmux_context import resolve_hook_target
+
+MAX_TITLE = 36
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+SESSIONS_ROOT = CODEX_HOME / "sessions"
+SESSION_INDEX_PATH = CODEX_HOME / "session_index.jsonl"
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+TITLE_CACHE_ROOT = CACHE_HOME / "codex-tmux-title" / "panes"
+CLAUDE_CACHE_ROOT = CACHE_HOME / "claude-statusline"
+LOG_PATH = Path(os.environ.get("CODEX_TMUX_TITLE_LOG", "/tmp/codex_tmux_title.log"))
+LOG_MAX_BYTES = 512 * 1024
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{32,36}$")
+
+
+def log(message):
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
+            LOG_PATH.replace(LOG_PATH.with_suffix(LOG_PATH.suffix + ".1"))
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {str(message).rstrip()}\n")
+    except Exception:
+        pass
+
+
+def clean(value):
+    text = str(value or "")
+    text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def shorten(value, max_len=MAX_TITLE):
+    text = clean(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max(0, max_len - 3)].rstrip() + "..."
+
+
+def as_int(value, default=0):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_key(value):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or ""))
+
+
+def server_key(socket):
+    socket = str(socket or "default")
+    name = safe_key(Path(socket).name) or "default"
+    digest = hashlib.sha256(socket.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{name}-{digest}"
+
+
+def tmux_command(socket=None):
+    cmd = ["tmux"]
+    if socket:
+        cmd.extend(["-S", socket])
+    return cmd
+
+
+def tmux(*args, socket=None):
+    try:
+        result = subprocess.run(
+            [*tmux_command(socket), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=0.8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip()
+
+
+def tmux_socket_from_env(env):
+    tmux_env = str(env.get("TMUX") or "")
+    return tmux_env.split(",", 1)[0] if tmux_env else ""
+
+
+def pane_context(pane, socket=None):
+    raw = tmux(
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{pid}\t#{pane_pid}\t#{window_id}\t#{pane_active}",
+        socket=socket,
+    )
+    parts = raw.split("\t")
+    if len(parts) != 4:
+        return None
+    return {
+        "server_pid": as_int(parts[0], -1),
+        "pane_pid": as_int(parts[1], -1),
+        "window_id": clean(parts[2]),
+        "pane_active": parts[3] == "1",
+    }
+
+
+def pane_cache_path(socket, pane):
+    return TITLE_CACHE_ROOT / server_key(socket) / f"{safe_key(pane)}.json"
+
+
+def cache_pane_title(socket, pane, title, session_id=""):
+    context = pane_context(pane, socket=socket)
+    if not context or not title:
+        return False
+    path = pane_cache_path(socket, pane)
+    payload = {
+        "socket": socket,
+        "pane": pane,
+        "server_pid": context["server_pid"],
+        "pane_pid": context["pane_pid"],
+        "title": shorten(title),
+        "session_id": clean(session_id),
+    }
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+        temp.chmod(0o600)
+        temp.replace(path)
+    except OSError:
+        return False
+    return True
+
+
+def cached_pane_title(socket, pane):
+    path = pane_cache_path(socket, pane)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    context = pane_context(pane, socket=socket)
+    if not context:
+        return ""
+    if (
+        payload.get("socket") != socket
+        or payload.get("pane") != pane
+        or as_int(payload.get("server_pid"), -2) != context["server_pid"]
+        or as_int(payload.get("pane_pid"), -2) != context["pane_pid"]
+    ):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return ""
+    return shorten(payload.get("title") or "")
+
+
+def proc_environ(pid):
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    env = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            key, value = item.split(b"=", 1)
+            env[key.decode(errors="ignore")] = value.decode(errors="ignore")
+    return env
+
+
+def proc_cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return " ".join(part.decode(errors="ignore") for part in raw.split(b"\0") if part)
+
+
+def proc_cmdline_parts(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+
+
+def process_rows():
+    try:
+        proc = subprocess.run(
+            ["ps", "-e", "-o", "pid=", "-o", "ppid=", "-o", "comm="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=0.8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3:
+            pid, ppid = as_int(parts[0], -1), as_int(parts[1], -1)
+            if pid >= 0 and ppid >= 0:
+                rows.append((pid, ppid, parts[2]))
+    return rows
+
+
+def descendants(root_pid):
+    children = {}
+    for pid, ppid, comm in process_rows():
+        children.setdefault(ppid, []).append((pid, comm))
+    stack, seen = list(children.get(root_pid, [])), set()
+    while stack:
+        pid, comm = stack.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        yield pid, comm
+        stack.extend(children.get(pid, []))
+
+
+def codex_pids():
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return
+    for proc in entries:
+        if not proc.name.isdigit():
+            continue
+        try:
+            if (proc / "comm").read_text(errors="ignore").strip() == "codex":
+                yield int(proc.name)
+        except OSError:
+            continue
+
+
+def open_transcripts(pid):
+    paths = []
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return paths
+    root = str(SESSIONS_ROOT)
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+            if target.startswith(root) and target.endswith(".jsonl"):
+                path = Path(target)
+                paths.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    return [path for _, path in sorted(paths, reverse=True)]
+
+
+def tail_lines(path, max_bytes=1024 * 1024):
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()
+            data = fh.read()
+    except OSError:
+        return []
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def session_id_from_transcript(path):
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            record = json.loads(fh.readline())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if record.get("type") != "session_meta":
+        return ""
+    return clean((record.get("payload") or {}).get("id") or "")
+
+
+def thread_name_for_session(session_id):
+    if not session_id or not SESSION_INDEX_PATH.exists():
+        return ""
+    try:
+        lines = SESSION_INDEX_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    name = ""
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if clean(record.get("id") or "") == session_id:
+            candidate = clean(record.get("thread_name") or "")
+            if candidate:
+                name = candidate
+    return name
+
+
+def thread_name_from_transcripts(paths):
+    for path in paths:
+        name = thread_name_for_session(session_id_from_transcript(path))
+        if name:
+            return name
+    return ""
+
+
+def codex_resume_value(pid):
+    parts = proc_cmdline_parts(pid)
+    for idx, part in enumerate(parts):
+        if part == "resume" and idx + 1 < len(parts):
+            return clean(parts[idx + 1])
+    return ""
+
+
+def derive_codex_title(pid, transcripts):
+    name = thread_name_from_transcripts(transcripts)
+    if name:
+        return shorten(name)
+    resume = codex_resume_value(pid)
+    if resume:
+        if UUID_RE.fullmatch(resume):
+            name = thread_name_for_session(resume)
+            return shorten(name or f"codex-{resume.split('-', 1)[0][:8]}")
+        return shorten(resume)
+    for path in transcripts:
+        session_id = session_id_from_transcript(path)
+        if session_id:
+            return shorten(f"codex-{session_id.split('-', 1)[0][:8]}")
+    return "codex"
+
+
+def title_for_hook(payload):
+    session_id = clean(payload.get("session_id") or "")
+    if not session_id:
+        return "", ""
+    name = thread_name_for_session(session_id)
+    return shorten(name or f"codex-{session_id.split('-', 1)[0][:8]}"), session_id
+
+
+def claude_agent_name(transcript_path):
+    if not transcript_path:
+        return ""
+    path = Path(transcript_path)
+    try:
+        if not path.exists():
+            return ""
+    except OSError:
+        return ""
+    for line in reversed(tail_lines(path, max_bytes=4 * 1024 * 1024)):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") == "agent-name":
+            name = clean(record.get("agentName") or "")
+            if name:
+                return name
+    return ""
+
+
+def title_from_claude_status(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "", "", ""
+    cwd = clean(data.get("cwd") or (data.get("workspace") or {}).get("current_dir") or "")
+    agent_name = claude_agent_name(clean(data.get("transcript_path") or ""))
+    title = agent_name or data.get("session_name") or Path(cwd).name or "claude"
+    return shorten(title), cwd, clean(data.get("session_id") or "")
+
+
+def claude_status_files():
+    if not CLAUDE_CACHE_ROOT.exists():
+        return []
+    paths = []
+    for path in CLAUDE_CACHE_ROOT.glob("*/latest.json"):
+        try:
+            paths.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    return [path for _, path in sorted(paths, reverse=True)]
+
+
+def claude_resume_arg(pid):
+    parts = proc_cmdline_parts(pid)
+    for idx, part in enumerate(parts):
+        if part == "--resume" and idx + 1 < len(parts):
+            return clean(parts[idx + 1])
+        if part.startswith("--resume="):
+            return clean(part.split("=", 1)[1])
+    return ""
+
+
+def claude_title_from_cache(pane, claude_pid, socket=None):
+    candidates = []
+    mapped_key = ""
+    pane_key = safe_key(pane)
+    pane_maps = [CLAUDE_CACHE_ROOT / "panes" / server_key(socket) / pane_key]
+    pane_maps.append(CLAUDE_CACHE_ROOT / "panes" / pane_key)  # legacy fallback
+    for pane_map in pane_maps:
+        try:
+            mapped_key = pane_map.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if mapped_key:
+            candidates.append(CLAUDE_CACHE_ROOT / mapped_key / "latest.json")
+            break
+
+    resume = claude_resume_arg(claude_pid)
+    if resume:
+        candidates.append(CLAUDE_CACHE_ROOT / safe_key(resume) / "latest.json")
+    env = proc_environ(claude_pid)
+    cwd = clean(env.get("PWD") or "")
+
+    if resume:
+        for path in claude_status_files():
+            title, _, session_id = title_from_claude_status(path)
+            if title and clean(resume) in (title, session_id):
+                return title
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        title, _, _ = title_from_claude_status(path)
+        if title:
+            return title
+    if cwd:
+        for path in claude_status_files():
+            title, file_cwd, _ = title_from_claude_status(path)
+            if title and file_cwd == cwd:
+                return title
+    if resume and not UUID_RE.fullmatch(resume):
+        return shorten(resume)
+    if cwd and Path(cwd).name:
+        return shorten(Path(cwd).name)
+    for key in (mapped_key, resume):
+        if clean(key):
+            return shorten(f"claude-{clean(key).split('-', 1)[0][:8]}")
+    return "claude"
+
+
+def rename_pane_window(pane, title, socket=None):
+    context = pane_context(pane, socket=socket)
+    if not context or not context["pane_active"] or not context["window_id"]:
+        return False
+    title = shorten(title)
+    current = tmux(
+        "display-message", "-p", "-t", context["window_id"], "#{window_name}", socket=socket
+    )
+    if current == title:
+        return True
+    try:
+        result = subprocess.run(
+            [*tmux_command(socket), "rename-window", "-t", context["window_id"], title],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode == 0:
+        log(f"renamed socket={socket or '-'} pane={pane} title={title!r}")
+        return True
+    return False
+
+
+def sync_claude_pane(pane, socket=None):
+    context = pane_context(pane, socket=socket)
+    if not context or context["pane_pid"] <= 0:
+        return 0
+    for pid, comm in descendants(context["pane_pid"]):
+        if comm == "claude":
+            title = claude_title_from_cache(pane, pid, socket=socket)
+            if title and rename_pane_window(pane, title, socket=socket):
+                return 1
+    return 0
+
+
+def sync_legacy(target_pane=None, socket=None):
+    changed = 0
+    target_socket = clean(socket or "")
+    if target_pane and not target_socket:
+        target_socket = tmux_socket_from_env(os.environ)
+    for pid in codex_pids():
+        cmdline = proc_cmdline(pid)
+        if " app-server" in f" {cmdline}":
+            continue
+        env = proc_environ(pid)
+        pane = env.get("TMUX_PANE")
+        pid_socket = tmux_socket_from_env(env)
+        if not pane or (target_socket and pid_socket != target_socket):
+            continue
+        if target_pane and pane != target_pane:
+            continue
+        transcripts = open_transcripts(pid)
+        resume = codex_resume_value(pid)
+        if not transcripts and not resume:
+            continue
+        title = derive_codex_title(pid, transcripts)
+        session_id = session_id_from_transcript(transcripts[0]) if transcripts else ""
+        actual_socket = pid_socket or target_socket
+        cache_pane_title(actual_socket, pane, title, session_id)
+        if rename_pane_window(pane, title, socket=actual_socket or None):
+            changed += 1
+    if target_pane and changed == 0:
+        changed += sync_claude_pane(target_pane, socket=target_socket or None)
+    return changed
+
+
+def read_hook_payload():
+    if sys.stdin.isatty():
+        return None
+    try:
+        raw = sys.stdin.read()
+    except OSError:
+        return None
+    if not raw.strip():
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log(f"ignored invalid hook JSON: {exc}")
+        return None
+    if not isinstance(payload, dict):
+        log("ignored hook input that was not a JSON object")
+        return None
+    return payload
+
+
+def sync_hook(payload):
+    socket, pane = resolve_hook_target(payload, os.environ)
+    if not pane or not socket:
+        log(
+            "could not route hook "
+            f"event={clean(payload.get('hook_event_name')) or '-'} "
+            f"session={clean(payload.get('session_id')) or '-'}"
+        )
+        return 0
+    title, session_id = title_for_hook(payload)
+    if not title:
+        return 0
+    cache_pane_title(socket, pane, title, session_id)
+    return int(rename_pane_window(pane, title, socket=socket))
+
+
+def sync_target(pane, socket=None):
+    socket = clean(socket or tmux_socket_from_env(os.environ))
+    title = cached_pane_title(socket, pane) if socket else ""
+    if title:
+        return int(rename_pane_window(pane, title, socket=socket))
+    return sync_legacy(pane, socket=socket or None)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pane")
+    parser.add_argument("--socket")
+    parser.add_argument("--all", action="store_true", help="scan legacy Codex processes")
+    args = parser.parse_args()
+
+    payload = read_hook_payload()
+    if payload is not None:
+        sync_hook(payload)
+    elif args.pane:
+        sync_target(args.pane, socket=args.socket)
+    elif args.all:
+        sync_legacy(socket=args.socket)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

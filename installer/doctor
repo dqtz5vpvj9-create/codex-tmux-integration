@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Audit an installed codex-tmux-integration deployment."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+
+MANAGED_BEGIN = "# >>> codex-tmux-integration >>>"
+
+
+def result(label: str, ok: bool, detail: str = "") -> None:
+    suffix = f" - {detail}" if detail else ""
+    print(f"{'PASS' if ok else 'FAIL'} {label}{suffix}")
+
+
+def command_path(command: str) -> Path | None:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    return Path(parts[0]).expanduser()
+
+
+def notification_setting(home: Path, key: str) -> str:
+    if os.environ.get(key):
+        return os.environ[key]
+    path = home / ".config/codex-tmux-integration/notifications.env"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    prefix = key + "="
+    for line in lines:
+        if line.startswith(prefix):
+            try:
+                values = shlex.split(line[len(prefix) :])
+            except ValueError:
+                return ""
+            return values[0] if values else ""
+    return ""
+
+
+def main() -> int:
+    home = Path(os.environ.get("CODEX_TMUX_HOME", Path.home())).expanduser().resolve()
+    state_path = home / ".local/state/codex-tmux-integration/state.json"
+    errors = 0
+    warnings = 0
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        result("state manifest", True, str(state_path))
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        result("state manifest", False, str(exc))
+        return 1
+
+    repo_root = Path(state.get("repo_root", ""))
+    enabled = state.get("enabled_features", [])
+    result("repository", repo_root.is_dir(), str(repo_root))
+    errors += not repo_root.is_dir()
+
+    for feature in enabled:
+        manifest = repo_root / "features" / feature / "feature.json"
+        ok = manifest.is_file()
+        result(f"feature {feature}", ok, str(manifest))
+        errors += not ok
+
+    for target_text, source_text in state.get("links", {}).items():
+        target = Path(target_text)
+        source = Path(source_text)
+        ok = target.is_symlink() and target.resolve() == source.resolve()
+        result(f"link {target.name}", ok, f"{target} -> {source}")
+        errors += not ok
+
+    tmux_main = home / ".tmux.conf"
+    zsh_main = home / ".zshrc"
+    for label, path in (("tmux managed block", tmux_main), ("zsh managed block", zsh_main)):
+        try:
+            ok = MANAGED_BEGIN in path.read_text(encoding="utf-8")
+        except OSError:
+            ok = False
+        result(label, ok, str(path))
+        errors += not ok
+
+    for label, path in (
+        ("Codex hooks JSON", home / ".codex/hooks.json"),
+        ("Claude settings JSON", home / ".claude/settings.json"),
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            hooks = data.get("hooks", {})
+            ok = isinstance(hooks, dict)
+            if ok:
+                for groups in hooks.values():
+                    if not isinstance(groups, list):
+                        continue
+                    for group in groups:
+                        for hook in group.get("hooks", []) if isinstance(group, dict) else []:
+                            command = hook.get("command", "") if isinstance(hook, dict) else ""
+                            executable = command_path(command)
+                            if executable and executable.name in {
+                                "agent-tmux-notify",
+                                "claude-tmux-notify-wrapper",
+                                "codex-tmux-notify-wrapper",
+                                "codex-tmux-title-sync",
+                            }:
+                                ok = ok and executable.is_file()
+        except (OSError, json.JSONDecodeError, TypeError):
+            ok = False
+        result(label, ok, str(path))
+        errors += not ok
+
+    zsh = shutil.which("zsh")
+    shell_config = home / ".config/codex-tmux-integration/shell.zsh"
+    if zsh and shell_config.exists():
+        check = subprocess.run(
+            [zsh, "-n", str(shell_config)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        ok = check.returncode == 0
+        detail = check.stderr.strip() or str(shell_config)
+    else:
+        ok = False
+        detail = "zsh or generated shell config missing"
+    result("zsh syntax", ok, detail)
+    errors += not ok
+
+    tmux = shutil.which("tmux")
+    tmux_config = home / ".config/codex-tmux-integration/tmux.conf"
+    if tmux and tmux_config.exists():
+        label = f"codex-tmux-doctor-{uuid.uuid4().hex[:10]}"
+        check = subprocess.run(
+            [tmux, "-L", label, "-f", str(tmux_config), "new-session", "-d", "-s", "doctor"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            [tmux, "-L", label, "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        ok = check.returncode == 0
+        detail = check.stderr.strip() or str(tmux_config)
+    else:
+        ok = False
+        detail = "tmux or generated tmux config missing"
+    result("isolated tmux config", ok, detail)
+    errors += not ok
+
+    queue_value = notification_setting(home, "ANDROIDTOOLS_NOTIFY_QUEUE")
+    if "external-notifications" in enabled:
+        queue = Path(queue_value).expanduser() if queue_value else None
+        if queue and queue.is_file():
+            print(f"PASS optional notification backend - {queue}")
+        else:
+            print("WARN optional notification backend is not configured")
+            warnings += 1
+
+    socket_base = Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}"
+    live = 0
+    if tmux and socket_base.is_dir():
+        for socket in socket_base.iterdir():
+            if not socket.is_socket():
+                continue
+            probe = subprocess.run(
+                [tmux, "-S", str(socket), "list-sessions"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            live += probe.returncode == 0
+    print(f"INFO live tmux servers - {live}")
+    print(f"SUMMARY errors={errors} warnings={warnings}")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

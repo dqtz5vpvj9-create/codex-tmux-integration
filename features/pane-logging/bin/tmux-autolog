@@ -1,0 +1,73 @@
+#!/bin/bash
+# Enable collision-free, bounded per-pane logs for the current tmux server.
+
+set -u
+umask 077
+
+LOGDIR="${TMUX_PANE_LOGDIR:-$HOME/.cache/tmux-pane-logs}"
+if [ -n "${TMUX_PANE_LOG_SINK:-}" ]; then
+  SINK="$TMUX_PANE_LOG_SINK"
+elif command -v tmux-log-sink >/dev/null 2>&1; then
+  SINK="$(command -v tmux-log-sink)"
+else
+  SINK="$HOME/.local/bin/tmux-log-sink"
+fi
+SOCKET=""
+
+if [ "${1:-}" = "--socket" ]; then
+  SOCKET="${2:-}"
+  shift 2
+fi
+if [ -z "$SOCKET" ] && [ -n "${TMUX:-}" ]; then
+  SOCKET="${TMUX%%,*}"
+fi
+
+tmux_cmd=(tmux)
+[ -n "$SOCKET" ] && tmux_cmd+=(-S "$SOCKET")
+
+server_key() {
+  local socket="${SOCKET:-default}" name hash
+  name=$(basename -- "$socket")
+  name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_')
+  hash=$(printf '%s' "$socket" | sha256sum | cut -c1-12)
+  printf '%s-%s\n' "${name:-default}" "$hash"
+}
+
+SERVER_KEY=$(server_key)
+SERVER_LOGDIR="$LOGDIR/$SERVER_KEY"
+mkdir -p "$SERVER_LOGDIR" || exit 0
+chmod 700 "$LOGDIR" "$SERVER_LOGDIR" 2>/dev/null || true
+
+enable_on() {
+  local pane="$1" already id logfile window pipe_command
+  [ -z "$pane" ] && return 0
+  already=$("${tmux_cmd[@]}" display-message -p -t "$pane" '#{pane_pipe}' 2>/dev/null)
+  [ "$already" = "1" ] && return 0
+
+  id="${pane#%}"
+  logfile="$SERVER_LOGDIR/${id}.log"
+  window=$("${tmux_cmd[@]}" display-message -p -t "$pane" '#{window_name}' 2>/dev/null)
+  {
+    printf '\n===== pipe-pane enabled %s server=%s pane=%s window=%s =====\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$SERVER_KEY" "$pane" "$window"
+    "${tmux_cmd[@]}" capture-pane -e -p -S - -t "$pane" 2>/dev/null
+  } | "$SINK" "$logfile"
+
+  printf -v pipe_command "exec %q %q" "$SINK" "$logfile"
+  "${tmux_cmd[@]}" pipe-pane -t "$pane" -o "$pipe_command" 2>/dev/null
+}
+
+case "${1:-sweep}" in
+  sweep)
+    while IFS= read -r pane; do
+      enable_on "$pane"
+    done < <("${tmux_cmd[@]}" list-panes -a -F '#{pane_id}' 2>/dev/null)
+    ;;
+  pane)
+    enable_on "${2:-}"
+    ;;
+  *)
+    echo "usage: $0 [--socket PATH] [sweep|pane <pane_id>]" >&2
+    exit 2
+    ;;
+esac

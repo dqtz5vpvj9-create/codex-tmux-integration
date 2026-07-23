@@ -1,0 +1,16 @@
+{
+  "name": "pane-logging",
+  "description": "Capture bounded per-pane logs and browse them across tmux servers.",
+  "dependencies": [],
+  "binaries": [
+    {"source": "bin/tmux-autolog", "name": "tmux-autolog"},
+    {"source": "bin/tmux-log-sink", "name": "tmux-log-sink"},
+    {"source": "bin/tlog", "name": "tlog"}
+  ],
+  "tmux": ["tmux/pane-logging.conf"],
+  "shell": [],
+  "hooks": {
+    "codex": [],
+    "claude": []
+  }
+}

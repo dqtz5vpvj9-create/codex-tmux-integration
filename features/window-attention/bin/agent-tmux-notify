@@ -1,60 +1,305 @@
 #!/usr/bin/env python3
-"""Mark the tmux window owning a Codex/Claude hook as needing attention."""
+"""Mark an inactive agent window and restore the previous style on focus."""
 
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any, Iterator
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SHARED_CONTEXT = REPO_ROOT / "shared" / "tmux-context"
 if str(SHARED_CONTEXT) not in sys.path:
     sys.path.insert(0, str(SHARED_CONTEXT))
 
-from agent_tmux_context import resolve_hook_target
+from agent_tmux_context import resolve_hook_target_details  # noqa: E402
+
+TMUX_TIMEOUT_SECONDS = 1.0
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+STATE_ROOT = CACHE_HOME / "codex-tmux-integration" / "window-attention"
+DEFAULT_STYLE = "fg=black,bg=#d7af00,bold"
 
 
-def tmux(socket, *args):
+def clean(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def as_int(value: Any, default: int = -1) -> int:
     try:
-        result = subprocess.run(
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_key(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or ""))
+
+
+def server_key(socket: str, server_pid: int) -> str:
+    digest = hashlib.sha256(f"{socket}\0{server_pid}".encode()).hexdigest()[:12]
+    return f"{safe_key(Path(socket).name)}-{server_pid}-{digest}"
+
+
+def tmux_result(socket: str, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
             ["tmux", "-S", socket, *args],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=1,
+            timeout=TMUX_TIMEOUT_SECONDS,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def tmux(socket: str, *args: str) -> str:
+    result = tmux_result(socket, *args)
+    if result is None or result.returncode != 0:
         return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
+    return result.stdout.strip()
 
 
-def main():
+def current_server_pid(socket: str) -> int:
+    return as_int(tmux(socket, "display-message", "-p", "#{pid}"))
+
+
+def window_for_pane(socket: str, pane: str) -> str:
+    return clean(tmux(socket, "display-message", "-p", "-t", pane, "#{window_id}"))
+
+
+def active_clients(socket: str, window: str) -> int:
+    return as_int(
+        tmux(
+            socket,
+            "display-message",
+            "-p",
+            "-t",
+            window,
+            "#{window_active_clients}",
+        ),
+        0,
+    )
+
+
+def current_style(socket: str, window: str) -> tuple[str, bool]:
+    local = tmux_result(
+        socket,
+        "show-window-options",
+        "-v",
+        "-t",
+        window,
+        "window-status-style",
+    )
+    local_value = clean(local.stdout) if local and local.returncode == 0 else ""
+    if local_value:
+        return local_value, True
+    inherited = tmux_result(
+        socket,
+        "show-window-options",
+        "-g",
+        "-v",
+        "window-status-style",
+    )
+    effective = (
+        clean(inherited.stdout)
+        if inherited and inherited.returncode == 0
+        else ""
+    )
+    return effective, False
+
+
+def set_style(socket: str, window: str, style: str) -> bool:
+    result = tmux_result(
+        socket,
+        "set-window-option",
+        "-t",
+        window,
+        "window-status-style",
+        style,
+    )
+    return result is not None and result.returncode == 0
+
+
+def unset_style(socket: str, window: str) -> bool:
+    result = tmux_result(
+        socket,
+        "set-window-option",
+        "-u",
+        "-t",
+        window,
+        "window-status-style",
+    )
+    return result is not None and result.returncode == 0
+
+
+def _server_root(socket: str, server_pid: int) -> Path:
+    return STATE_ROOT / "servers" / server_key(socket, server_pid)
+
+
+def state_path(socket: str, server_pid: int, window: str) -> Path:
+    return _server_root(socket, server_pid) / "windows" / f"{safe_key(window)}.json"
+
+
+def lock_path(socket: str, server_pid: int, window: str) -> Path:
+    return _server_root(socket, server_pid) / "locks" / f"{safe_key(window)}.lock"
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+@contextlib.contextmanager
+def window_lock(socket: str, server_pid: int, window: str) -> Iterator[None]:
+    path = lock_path(socket, server_pid, window)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as stream:
+        os.chmod(path, 0o600)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _restore_locked(socket: str, server_pid: int, window: str) -> bool:
+    path = state_path(socket, server_pid, window)
+    state = read_json(path)
+    if state is None:
+        path.unlink(missing_ok=True)
+        return False
+    current, _ = current_style(socket, window)
+    if current == clean(state.get("last_applied")):
+        if state.get("original_explicit"):
+            set_style(socket, window, clean(state.get("original_style")))
+        else:
+            unset_style(socket, window)
+    path.unlink(missing_ok=True)
+    return True
+
+
+def clear_window(socket: str, window: str) -> bool:
+    server_pid = current_server_pid(socket)
+    if server_pid <= 0 or not window:
+        return False
+    with window_lock(socket, server_pid, window):
+        return _restore_locked(socket, server_pid, window)
+
+
+def mark_window(socket: str, window: str, style: str) -> bool:
+    server_pid = current_server_pid(socket)
+    if server_pid <= 0 or not window:
+        return False
+    with window_lock(socket, server_pid, window):
+        if active_clients(socket, window) > 0:
+            _restore_locked(socket, server_pid, window)
+            return False
+        path = state_path(socket, server_pid, window)
+        state = read_json(path)
+        current, explicit = current_style(socket, window)
+        if state is None:
+            state = {
+                "version": 2,
+                "socket": socket,
+                "server_pid": server_pid,
+                "window_id": window,
+                "original_style": current,
+                "original_explicit": explicit,
+            }
+        elif current != clean(state.get("last_applied")):
+            state["original_style"] = current
+            state["original_explicit"] = explicit
+        if not set_style(socket, window, style):
+            return False
+        state["last_applied"] = style
+        state["updated_at_ns"] = time.time_ns()
+        atomic_write_json(path, state)
+        return True
+
+
+def cleanup_server(socket: str) -> int:
+    server_pid = current_server_pid(socket)
+    if server_pid <= 0:
+        return 0
+    root = _server_root(socket, server_pid)
+    restored = 0
+    for path in list((root / "windows").glob("*.json")):
+        state = read_json(path) or {}
+        window = clean(state.get("window_id"))
+        if window:
+            with window_lock(socket, server_pid, window):
+                restored += int(_restore_locked(socket, server_pid, window))
+    shutil.rmtree(root, ignore_errors=True)
+    return restored
+
+
+def read_payload() -> dict[str, Any]:
     try:
         raw = sys.stdin.read()
-        payload = json.loads(raw) if raw.strip() else {}
+        value = json.loads(raw) if raw.strip() else {}
     except (OSError, json.JSONDecodeError):
-        payload = {}
+        return {}
+    return value if isinstance(value, dict) else {}
 
-    socket, pane = resolve_hook_target(payload, os.environ)
+
+def mark_from_hook(payload: dict[str, Any]) -> bool:
+    target = resolve_hook_target_details(payload, os.environ)
+    if target.get("ambiguous"):
+        return False
+    socket = clean(target.get("socket"))
+    pane = clean(target.get("pane"))
     if not socket or not pane:
-        return 0
+        return False
+    window = window_for_pane(socket, pane)
+    style = os.environ.get("AGENT_TMUX_NOTIFY_STYLE", DEFAULT_STYLE)
+    return mark_window(socket, window, style) if window else False
 
-    window_id = tmux(socket, "display-message", "-p", "-t", pane, "#{window_id}")
-    if not window_id:
-        return 0
-    active_clients = tmux(
-        socket, "display-message", "-p", "-t", window_id, "#{window_active_clients}"
-    )
-    try:
-        if int(active_clients or "0") > 0:
-            return 0
-    except ValueError:
-        pass
 
-    style = os.environ.get("AGENT_TMUX_NOTIFY_STYLE", "fg=black,bg=#d7af00,bold")
-    tmux(socket, "set-window-option", "-t", window_id, "window-status-style", style)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--socket")
+    parser.add_argument("--window")
+    parser.add_argument("--clear-window", action="store_true")
+    parser.add_argument("--cleanup", action="store_true")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.clear_window:
+        if args.socket and args.window:
+            clear_window(args.socket, args.window)
+    elif args.cleanup:
+        if args.socket:
+            cleanup_server(args.socket)
+    else:
+        mark_from_hook(read_payload())
     return 0
 
 

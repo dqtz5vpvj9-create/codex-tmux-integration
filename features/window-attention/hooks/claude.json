@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/agent-tmux-notify",
+            "command": "env CODEX_TMUX_INTEGRATION=window-attention {{BIN_DIR}}/agent-tmux-notify",
             "timeout": 3
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/agent-tmux-notify",
+            "command": "env CODEX_TMUX_INTEGRATION=window-attention {{BIN_DIR}}/agent-tmux-notify",
             "timeout": 3
           }
         ]

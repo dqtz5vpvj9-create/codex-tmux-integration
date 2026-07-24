@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/claude-tmux-notify-wrapper stop",
+            "command": "env CODEX_TMUX_INTEGRATION=external-notifications {{BIN_DIR}}/claude-tmux-notify-wrapper stop",
             "timeout": 15
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/claude-tmux-notify-wrapper notification",
+            "command": "env CODEX_TMUX_INTEGRATION=external-notifications {{BIN_DIR}}/claude-tmux-notify-wrapper notification",
             "timeout": 15
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/claude-tmux-notify-wrapper plan",
+            "command": "env CODEX_TMUX_INTEGRATION=external-notifications {{BIN_DIR}}/claude-tmux-notify-wrapper plan",
             "timeout": 15
           }
         ]

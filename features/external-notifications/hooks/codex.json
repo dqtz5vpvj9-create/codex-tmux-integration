@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/codex-tmux-notify-wrapper stop",
+            "command": "env CODEX_TMUX_INTEGRATION=external-notifications {{BIN_DIR}}/codex-tmux-notify-wrapper stop",
             "timeout": 15,
             "statusMessage": "Sending completion notification"
           }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/codex-tmux-notify-wrapper notification",
+            "command": "env CODEX_TMUX_INTEGRATION=external-notifications {{BIN_DIR}}/codex-tmux-notify-wrapper notification",
             "timeout": 15,
             "statusMessage": "Sending approval notification"
           }

@@ -8,14 +8,34 @@ fragment, tmux or shell configuration, tests, and documentation.
 
 | Feature | Responsibility |
 | --- | --- |
-| `title-sync` | Rename the owning tmux window from the Codex session title. |
-| `window-attention` | Highlight inactive windows when an agent stops or needs input. |
-| `pane-logging` | Capture bounded logs per server and pane; browse them with `tlog`. |
-| `ssh-autoattach` | Safely select a server and session on interactive SSH login. |
-| `external-notifications` | Optionally forward hooks to AndroidTools notifications. |
+| `title-sync` | Rename a window from the active Codex session and restore the previous tmux name when ownership ends. |
+| `window-attention` | Highlight inactive windows when an agent stops or needs input, then restore the previous style. |
+| `pane-logging` | Capture bounded logs per server lifetime and pane; browse them with `tlog`. |
+| `ssh-autoattach` | Select a server and session on interactive SSH login. |
+| `external-notifications` | Optionally forward hooks to a user-configured notification backend. |
 
-The shared `tmux-context` component resolves a hook to the correct
-`socket_path + pane_id`. A pane id such as `%0` is not globally unique.
+The shared `tmux-context` component resolves a hook to a verified
+`socket path + server PID + pane ID`. Equal-scoring matches in different panes
+are treated as ambiguous and do not modify tmux state.
+
+## Runtime ownership
+
+The tmux features use explicit ownership markers instead of fixed hook indexes.
+Reloading configuration removes and recreates only entries marked for the same
+feature, leaving hooks installed by the user or another plugin unchanged.
+
+`title-sync` stores the original window name and `automatic-rename` behavior.
+It serializes updates per window, reads the active pane inside that serialized
+operation, and restores the previous state when the user selects a non-Codex
+pane, the Codex process exits, or a `SessionEnd` hook runs.
+
+`window-attention` preserves an existing `window-status-style`. `pane-logging`
+marks its pipe ownership and closes a pipe during cleanup only while the
+recorded sink process still owns it.
+
+Every tmux server that loads the generated configuration is recorded in a
+private local registry. This allows install, uninstall, `doctor`, and `tlog` to
+handle custom `tmux -S` socket paths as well as default sockets.
 
 ## Install
 
@@ -38,10 +58,12 @@ The installer:
 2. links feature commands into `~/.local/bin`;
 3. generates tmux and zsh aggregate files under
    `~/.config/codex-tmux-integration`;
-4. adds one managed source block to `.tmux.conf` and `.zshrc`;
-5. merges only feature-owned hook commands into Codex and Claude JSON.
+4. adds one managed source block to `.tmux.conf` or `.zshrc` when required;
+5. merges marker-owned hook commands while preserving unrelated settings;
+6. reconciles already-running registered tmux servers.
 
-It preserves unrelated hooks and never prints unrelated Claude settings.
+Reinstalling with a smaller feature set removes links and live runtime state
+that belonged to features no longer selected.
 
 ## Uninstall
 
@@ -50,7 +72,9 @@ It preserves unrelated hooks and never prints unrelated Claude settings.
 ./installer/uninstall
 ```
 
-Uninstall removes only links and hook/config entries owned by this repository.
+Uninstall restores managed window names and styles, removes marker-owned tmux
+hooks, closes verified project-owned logging pipes, and preserves unrelated
+configuration.
 
 ## Optional notification backend
 
@@ -69,7 +93,7 @@ The values are stored with mode `0600` under
 Missing notification infrastructure does not disable the tmux features.
 
 Do not commit generated hook payloads, pane logs, user configuration, state
-manifests, transcripts, or notification backend settings.
+manifests, transcripts, or notification backend settings. See `PRIVACY.md`.
 
 ## Validation
 
@@ -78,3 +102,6 @@ python3 -m pytest -q
 ./integration-tests/test_tmux_integration.sh
 ./installer/doctor
 ```
+
+GitHub Actions runs the Python suite, shell syntax checks, and isolated tmux
+integration tests on each pull request.

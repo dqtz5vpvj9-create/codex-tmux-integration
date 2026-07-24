@@ -1,25 +1,35 @@
 # Migration
 
 This repository intentionally contains no machine-specific migration snapshot.
-Capture the following information locally before cutover and keep it outside
-Git:
+Keep inventories, backups, socket paths, session identifiers, transcript paths,
+and notification configuration outside Git.
 
-- tmux socket paths and server count;
-- session, window, and pane identities;
-- current `pane_pipe` state;
-- hashes and permissions of files that the installer will replace;
-- a permissions-restricted backup of Codex, Claude, tmux, and shell config.
+## Upgrade to runtime state schema 2
+
+The installer records schema version 2 in its private state manifest. During the
+first upgrade from an earlier installation it performs narrowly scoped runtime
+migration on registered live tmux servers:
+
+- removes the historical hook indexes only when their command matches the old
+  feature implementation;
+- releases global window options previously set by title synchronization;
+- clears the historical default attention style where it is still present;
+- removes the legacy title cache;
+- installs marker-owned hooks and reconciles current windows and panes.
+
+A user hook at the same historical index remains in place when its command does
+not match the old feature command.
 
 ## Cutover
 
 1. Run `installer/install --dry-run`.
-2. Run the repository tests on an isolated tmux socket.
+2. Run the Python and isolated tmux tests.
 3. Install the selected features.
-4. Reload each live socket with the updated `.tmux.conf`.
-5. Run `tmux-autolog --socket <path> sweep`.
-6. Compare server, session, window, and pane identities against the private
-   baseline.
-7. Run `installer/doctor`.
+4. Run `installer/doctor`.
+5. Compare the local server, session, window, pane, and pipe inventory with the
+   private baseline.
 
-Never commit local backups, session identifiers, transcript paths, socket
-names, notification payloads, or pane logs.
+Install and uninstall now reconcile live sockets found in the private socket
+registry, including custom `tmux -S` paths. A server that has never loaded the
+generated configuration cannot appear in that registry and should be sourced
+once before migration.

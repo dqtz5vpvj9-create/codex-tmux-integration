@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Install selected codex-tmux-integration features idempotently."""
+"""Install selected codex-tmux-integration features and reconcile live tmux state."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shlex
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,9 +21,9 @@ from typing import Any
 
 from merge_hooks import apply_fragments, atomic_write_json, hooks_diff, load_json
 
-
 MANAGED_BEGIN = "# >>> codex-tmux-integration >>>"
 MANAGED_END = "# <<< codex-tmux-integration <<<"
+STATE_SCHEMA = 2
 ALL_FEATURES = (
     "title-sync",
     "window-attention",
@@ -28,22 +31,25 @@ ALL_FEATURES = (
     "ssh-autoattach",
     "external-notifications",
 )
-LEGACY_TMUX_PATTERNS = (
-    "codex-tmux-title-sync",
-    "Claude/Codex hooks own tmux window names",
-    "automatic-rename off",
-    "allow-set-title off",
-    "automatic-rename-format",
-    "Clear per-window highlight (set by agent-tmux-notify)",
-    "after-select-window[60]",
-    "after-select-pane[60]",
-    "client-attached[60]",
-    "client-focus-in[60]",
-    "Auto-enable pipe-pane logging on every pane",
-    "session-created[70]",
-    "after-new-window[70]",
-    "after-split-window[70]",
-)
+TMUX_FEATURES = {"title-sync", "window-attention", "pane-logging"}
+LEGACY_HOOKS = {
+    "title-sync": {
+        "pane-focus-in[50]": "codex-tmux-title-sync",
+        "after-select-pane[50]": "codex-tmux-title-sync",
+        "after-select-window[50]": "codex-tmux-title-sync",
+    },
+    "window-attention": {
+        "after-select-window[60]": "window-status-style",
+        "after-select-pane[60]": "window-status-style",
+        "client-attached[60]": "window-status-style",
+        "client-focus-in[60]": "window-status-style",
+    },
+    "pane-logging": {
+        "session-created[70]": "tmux-autolog",
+        "after-new-window[70]": "tmux-autolog",
+        "after-split-window[70]": "tmux-autolog",
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,9 +72,9 @@ def atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if mode is None:
         mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
@@ -79,6 +85,17 @@ def atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def create_backup_root(state_root: Path, prefix: str = "") -> tuple[Path, str]:
+    """Create a unique backup directory and return its display timestamp."""
+
+    stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%dT%H%M%S%z")
+    backups = state_root / "backups"
+    backups.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup_root = Path(tempfile.mkdtemp(prefix=f"{prefix}{stamp}-", dir=backups))
+    backup_root.chmod(0o700)
+    return backup_root, stamp
 
 
 def sha256(path: Path) -> str:
@@ -125,25 +142,11 @@ def install_managed_block(text: str, body: str) -> str:
 
 
 def desired_tmux_main(current: str, config_path: Path) -> str:
-    clean = strip_managed_block(current)
-    lines = []
-    for line in clean.splitlines():
-        if any(pattern in line for pattern in LEGACY_TMUX_PATTERNS):
-            continue
-        lines.append(line)
-    clean = "\n".join(lines).rstrip() + "\n"
-    return install_managed_block(clean, f'source-file "{config_path}"')
+    return install_managed_block(current, f'source-file "{config_path}"')
 
 
 def desired_zsh_main(current: str, shell_path: Path) -> str:
-    clean = strip_managed_block(current)
-    legacy = re.compile(
-        r"\n?# SSH login: choose a tmux server/session, or select one through env vars\."
-        r".*?\nfi\n(?=\n*cxc\(\))",
-        re.DOTALL,
-    )
-    clean = legacy.sub("\n", clean)
-    return install_managed_block(clean, f'source "{shell_path}"')
+    return install_managed_block(current, f'source "{shell_path}"')
 
 
 def desired_aggregators(
@@ -177,6 +180,8 @@ def desired_links(
         for item in manifest.get("binaries", []):
             source = (feature_root / item["source"]).resolve()
             target = bin_dir / item["name"]
+            if target in links and links[target] != source:
+                raise ValueError(f"duplicate binary target: {target}")
             links[target] = source
     return links
 
@@ -191,6 +196,13 @@ def add_shared_compatibility_links(
     if {"title-sync", "window-attention"} & set(names):
         result[bin_dir / "agent_tmux_context.py"] = (
             repo_root / "shared/tmux-context/agent_tmux_context.py"
+        ).resolve()
+    if TMUX_FEATURES & set(names):
+        result[bin_dir / "codex-tmux-hook-manager"] = (
+            repo_root / "shared/tmux-runtime/codex-tmux-hook-manager"
+        ).resolve()
+        result[bin_dir / "tmux_runtime.py"] = (
+            repo_root / "shared/tmux-runtime/tmux_runtime.py"
         ).resolve()
     return result
 
@@ -224,6 +236,185 @@ def replace_link(target: Path, source: Path) -> None:
     os.replace(temporary, target)
 
 
+def remove_recorded_link(target: Path, source: Path) -> bool:
+    if target.is_symlink() and target.resolve() == source.resolve():
+        target.unlink()
+        return True
+    return False
+
+
+def load_runtime_module(repo_root: Path):
+    path = repo_root / "shared/tmux-runtime/tmux_runtime.py"
+    spec = importlib.util.spec_from_file_location("codex_tmux_runtime_installer", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load runtime module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_command(
+    command: list[str],
+    *,
+    home: Path,
+    timeout: float = 5,
+) -> subprocess.CompletedProcess[str] | None:
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def cleanup_feature_runtime(home: Path, bin_dir: Path, socket: str, feature: str) -> None:
+    manager = bin_dir / "codex-tmux-hook-manager"
+    if manager.exists():
+        run_command(
+            [sys.executable, str(manager), "remove", feature, "--socket", socket],
+            home=home,
+        )
+    cleanup_commands = {
+        "title-sync": [bin_dir / "codex-tmux-title-sync", "--cleanup", "--socket", socket],
+        "window-attention": [bin_dir / "agent-tmux-notify", "--cleanup", "--socket", socket],
+        "pane-logging": [bin_dir / "tmux-autolog", "--socket", socket, "cleanup"],
+    }
+    command = cleanup_commands.get(feature)
+    if command and Path(command[0]).exists():
+        run_command([str(item) for item in command], home=home)
+
+
+def remove_legacy_hooks(home: Path, socket: str, features: list[str]) -> None:
+    for feature in features:
+        for target, marker in LEGACY_HOOKS.get(feature, {}).items():
+            hook_name = target.split("[", 1)[0]
+            shown = run_command(
+                ["tmux", "-S", socket, "show-hooks", "-g", hook_name],
+                home=home,
+            )
+            if shown is None or shown.returncode != 0:
+                continue
+            if any(line.startswith(target + " ") and marker in line for line in shown.stdout.splitlines()):
+                run_command(
+                    ["tmux", "-S", socket, "set-hook", "-gu", target],
+                    home=home,
+                )
+
+
+def migrate_legacy_runtime(home: Path, socket: str, features: list[str]) -> None:
+    remove_legacy_hooks(home, socket, features)
+    if "title-sync" in features:
+        for option in ("automatic-rename", "allow-set-title", "automatic-rename-format"):
+            run_command(
+                ["tmux", "-S", socket, "set-window-option", "-gu", option],
+                home=home,
+            )
+    if "window-attention" in features:
+        windows = run_command(
+            [
+                "tmux",
+                "-S",
+                socket,
+                "list-windows",
+                "-a",
+                "-F",
+                "#{window_id}\t#{window_status_style}",
+            ],
+            home=home,
+        )
+        if windows and windows.returncode == 0:
+            for line in windows.stdout.splitlines():
+                window, separator, style = line.partition("\t")
+                if separator and style == "fg=black,bg=#d7af00,bold":
+                    run_command(
+                        [
+                            "tmux",
+                            "-S",
+                            socket,
+                            "set-window-option",
+                            "-u",
+                            "-t",
+                            window,
+                            "window-status-style",
+                        ],
+                        home=home,
+                    )
+
+
+def reconcile_runtime(
+    *,
+    home: Path,
+    repo_root: Path,
+    bin_dir: Path,
+    tmux_aggregate: Path,
+    names: list[str],
+    removed: list[str],
+    previous_features: list[str],
+    migrate_legacy: bool,
+) -> list[str]:
+    runtime = load_runtime_module(repo_root)
+    messages: list[str] = []
+    for socket in runtime.live_sockets(home):
+        if migrate_legacy:
+            migrate_legacy_runtime(home, socket, previous_features)
+            if "pane-logging" in previous_features and (bin_dir / "tmux-autolog").exists():
+                run_command(
+                    [str(bin_dir / "tmux-autolog"), "--socket", socket, "migrate"],
+                    home=home,
+                )
+        for feature in removed:
+            cleanup_feature_runtime(home, bin_dir, socket, feature)
+        if TMUX_FEATURES & set(names):
+            sourced = run_command(
+                ["tmux", "-S", socket, "source-file", str(tmux_aggregate)],
+                home=home,
+            )
+            if sourced is None or sourced.returncode != 0:
+                detail = sourced.stderr.strip() if sourced else "tmux unavailable"
+                messages.append(f"warning: could not source {socket}: {detail}")
+                continue
+            runtime.register_socket(socket, runtime.server_pid(socket), home)
+            if "pane-logging" in names:
+                run_command(
+                    [str(bin_dir / "tmux-autolog"), "--socket", socket, "sweep"],
+                    home=home,
+                )
+            if "title-sync" in names:
+                run_command(
+                    [str(bin_dir / "codex-tmux-title-sync"), "--socket", socket, "--all"],
+                    home=home,
+                )
+        messages.append(f"reconciled live tmux socket: {socket}")
+    if migrate_legacy:
+        shutil.rmtree(home / ".cache/codex-tmux-title", ignore_errors=True)
+    return messages
+
+
+def notification_config_text(args: argparse.Namespace) -> str | None:
+    if not args.notification_queue and not args.notification_python:
+        return None
+    lines = ["# Generated locally by codex-tmux-integration. Do not commit."]
+    if args.notification_queue:
+        lines.append(
+            "ANDROIDTOOLS_NOTIFY_QUEUE="
+            + shlex.quote(str(args.notification_queue.expanduser().resolve()))
+        )
+    if args.notification_python:
+        lines.append(
+            "ANDROIDTOOLS_NOTIFY_PYTHON="
+            + shlex.quote(str(args.notification_python.expanduser().resolve()))
+        )
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     args = parse_args()
     home = args.home.expanduser().resolve()
@@ -234,6 +425,12 @@ def main() -> int:
     bin_dir = home / ".local" / "bin"
     config_root = home / ".config" / "codex-tmux-integration"
     state_root = home / ".local" / "state" / "codex-tmux-integration"
+    state_path = state_root / "state.json"
+    previous_state = load_json(state_path)
+    previous_features = list(previous_state.get("enabled_features", []))
+    previous_schema = int(previous_state.get("schema", 1)) if previous_state else STATE_SCHEMA
+    removed = [name for name in previous_features if name not in names]
+
     tmux_aggregate = config_root / "tmux.conf"
     shell_aggregate = config_root / "shell.zsh"
     tmux_main = home / ".tmux.conf"
@@ -243,10 +440,20 @@ def main() -> int:
     notification_config = config_root / "notifications.env"
 
     tmux_text, shell_text = desired_aggregators(manifests)
+    has_tmux = any(manifest.get("tmux") for _, manifest in manifests)
+    has_shell = any(manifest.get("shell") for _, manifest in manifests)
     current_tmux_main = tmux_main.read_text(encoding="utf-8") if tmux_main.exists() else ""
     current_zsh_main = zsh_main.read_text(encoding="utf-8") if zsh_main.exists() else ""
-    wanted_tmux_main = desired_tmux_main(current_tmux_main, tmux_aggregate)
-    wanted_zsh_main = desired_zsh_main(current_zsh_main, shell_aggregate)
+    wanted_tmux_main = (
+        desired_tmux_main(current_tmux_main, tmux_aggregate)
+        if has_tmux
+        else strip_managed_block(current_tmux_main)
+    )
+    wanted_zsh_main = (
+        desired_zsh_main(current_zsh_main, shell_aggregate)
+        if has_shell
+        else strip_managed_block(current_zsh_main)
+    )
 
     replacements = {"BIN_DIR": str(bin_dir), "REPO_ROOT": str(repo_root)}
     codex_before = load_json(codex_hooks)
@@ -260,31 +467,35 @@ def main() -> int:
     links = add_shared_compatibility_links(
         desired_links(manifests, bin_dir), names, repo_root, bin_dir
     )
-    notification_text = None
-    if args.notification_queue or args.notification_python:
-        notification_lines = [
-            "# Generated locally by codex-tmux-integration. Do not commit."
-        ]
-        if args.notification_queue:
-            notification_lines.append(
-                "ANDROIDTOOLS_NOTIFY_QUEUE="
-                + shlex.quote(str(args.notification_queue.expanduser().resolve()))
-            )
-        if args.notification_python:
-            notification_lines.append(
-                "ANDROIDTOOLS_NOTIFY_PYTHON="
-                + shlex.quote(str(args.notification_python.expanduser().resolve()))
-            )
-        notification_text = "\n".join(notification_lines) + "\n"
+    previous_links = {
+        Path(target): Path(source)
+        for target, source in previous_state.get("links", {}).items()
+    }
+    stale_links = {
+        target: source for target, source in previous_links.items() if target not in links
+    }
+    private_notification_text = notification_config_text(args)
 
     changes: list[str] = []
     for target, source in links.items():
         if not link_matches(target, source):
             changes.append(f"link {target} -> {source}")
-    if not tmux_aggregate.exists() or tmux_aggregate.read_text(encoding="utf-8") != tmux_text:
+    for target in stale_links:
+        changes.append(f"unlink stale managed target {target}")
+    if has_tmux and (
+        not tmux_aggregate.exists()
+        or tmux_aggregate.read_text(encoding="utf-8") != tmux_text
+    ):
         changes.append(f"write {tmux_aggregate}")
-    if not shell_aggregate.exists() or shell_aggregate.read_text(encoding="utf-8") != shell_text:
+    if not has_tmux and tmux_aggregate.exists():
+        changes.append(f"remove {tmux_aggregate}")
+    if has_shell and (
+        not shell_aggregate.exists()
+        or shell_aggregate.read_text(encoding="utf-8") != shell_text
+    ):
         changes.append(f"write {shell_aggregate}")
+    if not has_shell and shell_aggregate.exists():
+        changes.append(f"remove {shell_aggregate}")
     if current_tmux_main != wanted_tmux_main:
         changes.append(f"update {tmux_main}")
     if current_zsh_main != wanted_zsh_main:
@@ -293,29 +504,42 @@ def main() -> int:
         changes.append(f"merge hooks in {codex_hooks}")
     if claude_before != claude_after:
         changes.append(f"merge hooks in {claude_settings}")
-    if notification_text is not None and (
+    if private_notification_text is not None and (
         not notification_config.exists()
-        or notification_config.read_text(encoding="utf-8") != notification_text
+        or notification_config.read_text(encoding="utf-8") != private_notification_text
     ):
         changes.append(f"write private notification config {notification_config}")
 
-    if not changes:
-        print(f"already up to date: {', '.join(names)}")
-        return 0
-
-    print("planned changes:")
-    for change in changes:
-        print(f"  - {change}")
+    if changes:
+        print("planned changes:")
+        for change in changes:
+            print(f"  - {change}")
     if codex_before != codex_after:
         print(hooks_diff(codex_before, codex_after, str(codex_hooks)))
     if claude_before != claude_after:
         print(hooks_diff(claude_before, claude_after, str(claude_settings)))
     if args.dry_run:
+        if not changes:
+            print(f"already up to date: {', '.join(names)}")
         return 0
 
-    stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%dT%H%M%S%z")
-    backup_root = state_root / "backups" / stamp
-    backup_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    if not changes and previous_state and previous_schema >= STATE_SCHEMA and not removed:
+        runtime_messages = reconcile_runtime(
+            home=home,
+            repo_root=repo_root,
+            bin_dir=bin_dir,
+            tmux_aggregate=tmux_aggregate,
+            names=names,
+            removed=[],
+            previous_features=previous_features,
+            migrate_legacy=False,
+        )
+        for message in runtime_messages:
+            print(message)
+        print(f"already up to date: {', '.join(names)}")
+        return 0
+
+    backup_root, stamp = create_backup_root(state_root)
     backup_paths(
         [
             tmux_main,
@@ -326,6 +550,7 @@ def main() -> int:
             shell_aggregate,
             notification_config,
             *links.keys(),
+            *stale_links.keys(),
         ],
         backup_root,
         home,
@@ -333,29 +558,51 @@ def main() -> int:
 
     for target, source in links.items():
         replace_link(target, source)
-    atomic_write_text(tmux_aggregate, tmux_text)
-    atomic_write_text(shell_aggregate, shell_text)
+    if has_tmux:
+        atomic_write_text(tmux_aggregate, tmux_text)
+    else:
+        tmux_aggregate.unlink(missing_ok=True)
+    if has_shell:
+        atomic_write_text(shell_aggregate, shell_text)
+    else:
+        shell_aggregate.unlink(missing_ok=True)
     atomic_write_text(tmux_main, wanted_tmux_main)
     atomic_write_text(zsh_main, wanted_zsh_main)
     atomic_write_json(codex_hooks, codex_after)
     atomic_write_json(claude_settings, claude_after)
-    if notification_text is not None:
-        atomic_write_text(notification_config, notification_text, mode=0o600)
+    if private_notification_text is not None:
+        atomic_write_text(notification_config, private_notification_text, mode=0o600)
+
+    runtime_messages = reconcile_runtime(
+        home=home,
+        repo_root=repo_root,
+        bin_dir=bin_dir,
+        tmux_aggregate=tmux_aggregate,
+        names=names,
+        removed=removed,
+        previous_features=previous_features,
+        migrate_legacy=bool(previous_state) and previous_schema < STATE_SCHEMA,
+    )
+
+    for target, source in stale_links.items():
+        if not remove_recorded_link(target, source) and (target.exists() or target.is_symlink()):
+            print(f"kept user-modified target: {target}")
 
     state = {
+        "schema": STATE_SCHEMA,
         "repo_root": str(repo_root),
         "enabled_features": names,
         "backup_root": str(backup_root),
         "installed_at": stamp,
         "links": {str(target): str(source) for target, source in links.items()},
-        "config": {
-            str(tmux_aggregate): sha256(tmux_aggregate),
-            str(shell_aggregate): sha256(shell_aggregate),
-        },
+        "config": {},
     }
-    if notification_config.exists():
-        state["config"][str(notification_config)] = sha256(notification_config)
-    atomic_write_json(state_root / "state.json", state)
+    for path in (tmux_aggregate, shell_aggregate, notification_config):
+        if path.exists():
+            state["config"][str(path)] = sha256(path)
+    atomic_write_json(state_path, state)
+    for message in runtime_messages:
+        print(message)
     print(f"installed: {', '.join(names)}")
     print(f"backup: {backup_root}")
     return 0

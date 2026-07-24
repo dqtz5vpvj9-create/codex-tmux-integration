@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Remove selected codex-tmux-integration features without touching other config."""
+"""Remove selected features and their live tmux runtime state."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.machinery
 import importlib.util
-import os
-from datetime import datetime, timezone
 from pathlib import Path
 
 from merge_hooks import apply_fragments, atomic_write_json, hooks_diff, load_json
@@ -58,7 +56,6 @@ def main() -> int:
         removed = installed
     remaining = [name for name in installed if name not in removed]
 
-    installed_manifests = [install.load_manifest(repo_root, name) for name in installed]
     remaining_manifests = [install.load_manifest(repo_root, name) for name in remaining]
     bin_dir = home / ".local" / "bin"
     config_root = home / ".config" / "codex-tmux-integration"
@@ -70,8 +67,7 @@ def main() -> int:
     claude_settings = home / ".claude" / "settings.json"
 
     installed_links = {
-        Path(target): Path(source)
-        for target, source in state.get("links", {}).items()
+        Path(target): Path(source) for target, source in state.get("links", {}).items()
     }
     remaining_links = install.add_shared_compatibility_links(
         install.desired_links(remaining_manifests, bin_dir),
@@ -126,9 +122,9 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%dT%H%M%S%z")
-    backup_root = state_root / "backups" / f"uninstall-{stamp}"
-    backup_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    backup_root, stamp = install.create_backup_root(
+    state_root, prefix="uninstall-"
+)
     install.backup_paths(
         [
             tmux_main,
@@ -143,12 +139,6 @@ def main() -> int:
         home,
     )
 
-    for target, source in removed_links.items():
-        if target.is_symlink() and target.resolve() == source.resolve():
-            target.unlink()
-        elif target.exists() or target.is_symlink():
-            print(f"kept user-modified target: {target}")
-
     if has_tmux:
         install.atomic_write_text(tmux_aggregate, tmux_text)
     else:
@@ -162,13 +152,41 @@ def main() -> int:
     atomic_write_json(codex_hooks, codex_after)
     atomic_write_json(claude_settings, claude_after)
 
-    state["enabled_features"] = remaining
-    state["backup_root"] = str(backup_root)
-    state["installed_at"] = stamp
-    state["links"] = {
-        str(target): str(source) for target, source in remaining_links.items()
-    }
-    atomic_write_json(state_path, state)
+    runtime_messages = install.reconcile_runtime(
+        home=home,
+        repo_root=repo_root,
+        bin_dir=bin_dir,
+        tmux_aggregate=tmux_aggregate,
+        names=remaining,
+        removed=removed,
+        previous_features=installed,
+        migrate_legacy=int(state.get("schema", 1)) < install.STATE_SCHEMA,
+    )
+
+    for target, source in removed_links.items():
+        if not install.remove_recorded_link(target, source) and (
+            target.exists() or target.is_symlink()
+        ):
+            print(f"kept user-modified target: {target}")
+
+    if remaining:
+        state["schema"] = install.STATE_SCHEMA
+        state["enabled_features"] = remaining
+        state["backup_root"] = str(backup_root)
+        state["installed_at"] = stamp
+        state["links"] = {
+            str(target): str(source) for target, source in remaining_links.items()
+        }
+        state["config"] = {}
+        for path in (tmux_aggregate, shell_aggregate, config_root / "notifications.env"):
+            if path.exists():
+                state["config"][str(path)] = install.sha256(path)
+        atomic_write_json(state_path, state)
+    else:
+        state_path.unlink(missing_ok=True)
+
+    for message in runtime_messages:
+        print(message)
     print(f"backup: {backup_root}")
     return 0
 

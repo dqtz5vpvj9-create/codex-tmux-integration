@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Install and remove marker-owned tmux hooks without fixed array indexes."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Iterable
+
+RUNTIME_ROOT = Path(__file__).resolve().parent
+if str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
+
+from tmux_runtime import register_socket, server_pid, socket_from_tmux_env  # noqa: E402
+
+TMUX_TIMEOUT_SECONDS = 1.0
+HOOK_LINE_RE = re.compile(r"^(?P<name>[^\s\[]+)(?:\[(?P<index>\d+)\])?\s+(?P<command>.*)$")
+
+
+def _bin(name: str) -> str:
+    return str(Path.home() / ".local" / "bin" / name)
+
+
+def _run_shell(
+    feature: str,
+    executable: str,
+    *arguments: str,
+    background: bool = True,
+) -> str:
+    words = ["env", f"CODEX_TMUX_HOOK={feature}", _bin(executable), *arguments]
+    shell_command = " ".join(
+        word if word.startswith("#{") and word.endswith("}") else shlex.quote(word)
+        for word in words
+    )
+    command = "run-shell -b" if background else "run-shell"
+    return f"{command} {shlex.quote(shell_command)}"
+
+
+FEATURE_HOOKS: dict[str, tuple[tuple[str, str], ...]] = {
+    "title-sync": (
+        (
+            "pane-focus-in",
+            _run_shell(
+                "title-sync",
+                "codex-tmux-title-sync",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+            ),
+        ),
+        (
+            "after-select-pane",
+            _run_shell(
+                "title-sync",
+                "codex-tmux-title-sync",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+            ),
+        ),
+        (
+            "after-select-window",
+            _run_shell(
+                "title-sync",
+                "codex-tmux-title-sync",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+            ),
+        ),
+        (
+            "pane-exited",
+            _run_shell(
+                "title-sync",
+                "codex-tmux-title-sync",
+                "--socket",
+                "#{q:socket_path}",
+                "--pane",
+                "#{hook_pane}",
+                "--window",
+                "#{hook_window}",
+                "--pane-exited",
+            ),
+        ),
+    ),
+    "window-attention": (
+        (
+            "after-select-window",
+            _run_shell(
+                "window-attention",
+                "agent-tmux-notify",
+                "--clear-window",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+                background=False,
+            ),
+        ),
+        (
+            "after-select-pane",
+            _run_shell(
+                "window-attention",
+                "agent-tmux-notify",
+                "--clear-window",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+                background=False,
+            ),
+        ),
+        (
+            "client-attached",
+            _run_shell(
+                "window-attention",
+                "agent-tmux-notify",
+                "--clear-window",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+                background=False,
+            ),
+        ),
+        (
+            "client-focus-in",
+            _run_shell(
+                "window-attention",
+                "agent-tmux-notify",
+                "--clear-window",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+                background=False,
+            ),
+        ),
+    ),
+    "pane-logging": (
+        (
+            "session-created",
+            _run_shell(
+                "pane-logging",
+                "tmux-autolog",
+                "--socket",
+                "#{q:socket_path}",
+                "sweep",
+            ),
+        ),
+        (
+            "after-new-window",
+            _run_shell(
+                "pane-logging",
+                "tmux-autolog",
+                "--socket",
+                "#{q:socket_path}",
+                "pane",
+                "#{pane_id}",
+            ),
+        ),
+        (
+            "after-split-window",
+            _run_shell(
+                "pane-logging",
+                "tmux-autolog",
+                "--socket",
+                "#{q:socket_path}",
+                "pane",
+                "#{pane_id}",
+            ),
+        ),
+    ),
+}
+
+
+def tmux(socket: str, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["tmux", "-S", socket, *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=TMUX_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def owned_hook_targets(socket: str, feature: str, hook_name: str) -> list[str]:
+    result = tmux(socket, "show-hooks", "-g", hook_name)
+    if result is None or result.returncode != 0:
+        return []
+    marker = f"CODEX_TMUX_HOOK={feature}"
+    targets = []
+    for line in result.stdout.splitlines():
+        match = HOOK_LINE_RE.match(line.strip())
+        if not match or marker not in match.group("command"):
+            continue
+        index = match.group("index")
+        targets.append(f"{hook_name}[{index}]" if index is not None else hook_name)
+    return targets
+
+
+def remove_feature(socket: str, feature: str) -> int:
+    removed = 0
+    hook_names = {hook_name for hook_name, _ in FEATURE_HOOKS[feature]}
+    for hook_name in hook_names:
+        for target in owned_hook_targets(socket, feature, hook_name):
+            result = tmux(socket, "set-hook", "-gu", target)
+            if result is not None and result.returncode == 0:
+                removed += 1
+    return removed
+
+
+def install_feature(socket: str, feature: str) -> int:
+    remove_feature(socket, feature)
+    installed = 0
+    for hook_name, command in FEATURE_HOOKS[feature]:
+        result = tmux(socket, "set-hook", "-ag", hook_name, command)
+        if result is not None and result.returncode == 0:
+            installed += 1
+    register_socket(socket, server_pid(socket))
+    return installed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("operation", choices=("install", "remove", "list-owned"))
+    parser.add_argument("feature", choices=tuple(FEATURE_HOOKS))
+    parser.add_argument("--socket")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    socket = args.socket or socket_from_tmux_env()
+    if not socket:
+        return 0
+    if args.operation == "install":
+        install_feature(socket, args.feature)
+    elif args.operation == "remove":
+        remove_feature(socket, args.feature)
+    else:
+        for hook_name, _ in FEATURE_HOOKS[args.feature]:
+            for target in owned_hook_targets(socket, args.feature, hook_name):
+                print(target)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

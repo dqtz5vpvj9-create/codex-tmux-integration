@@ -14,7 +14,8 @@ def prepare_home(home):
     (home / ".local/bin").mkdir(parents=True)
     (home / ".tmux.conf").write_text(
         "set -g mouse on\n"
-        "set-hook -g 'pane-focus-in[50]' 'run-shell codex-tmux-title-sync'\n",
+        "set -g automatic-rename off\n"
+        "set-hook -g 'pane-focus-in[50]' 'run-shell /opt/user/codex-tmux-title-sync'\n",
         encoding="utf-8",
     )
     (home / ".zshrc").write_text("alias ll='ls -l'\n", encoding="utf-8")
@@ -27,7 +28,7 @@ def prepare_home(home):
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": "/home/example/.codex/xbrd/quota.sh",
+                                    "command": "/opt/user/quota.sh",
                                 }
                             ]
                         }
@@ -38,7 +39,7 @@ def prepare_home(home):
         encoding="utf-8",
     )
     (home / ".claude/settings.json").write_text(
-        json.dumps({"env": {"SECRET": "keep"}, "hooks": {}}),
+        json.dumps({"env": {"SETTING": "keep"}, "hooks": {}}),
         encoding="utf-8",
     )
 
@@ -66,20 +67,38 @@ def test_install_is_idempotent_and_preserves_unrelated_data(tmp_path):
         features,
     )
     assert first.returncode == 0, first.stderr
-    assert (tmp_path / ".local/bin/codex-tmux-title-sync").is_symlink()
-    assert (tmp_path / ".local/bin/agent-tmux-notify").is_symlink()
-    assert (tmp_path / ".local/bin/agent_tmux_context.py").is_symlink()
-    assert "# >>> codex-tmux-integration >>>" in (
-        tmp_path / ".tmux.conf"
-    ).read_text()
+    for name in (
+        "codex-tmux-title-sync",
+        "agent-tmux-notify",
+        "agent_tmux_context.py",
+        "codex-tmux-hook-manager",
+        "tmux_runtime.py",
+    ):
+        assert (tmp_path / ".local/bin" / name).is_symlink()
+    tmux_main = (tmp_path / ".tmux.conf").read_text()
+    assert "# >>> codex-tmux-integration >>>" in tmux_main
+    assert "set -g automatic-rename off" in tmux_main
+    assert "/opt/user/codex-tmux-title-sync" in tmux_main
     codex = json.loads((tmp_path / ".codex/hooks.json").read_text())
     claude = json.loads((tmp_path / ".claude/settings.json").read_text())
-    assert claude["env"]["SECRET"] == "keep"
+    assert claude["env"]["SETTING"] == "keep"
     assert any(
-        hook["command"] == "/home/example/.codex/xbrd/quota.sh"
+        hook["command"] == "/opt/user/quota.sh"
         for group in codex["hooks"]["Stop"]
         for hook in group["hooks"]
     )
+    assert "SessionEnd" in codex["hooks"]
+    assert all(
+        "CODEX_TMUX_INTEGRATION=" in hook["command"]
+        for groups in codex["hooks"].values()
+        for group in groups
+        for hook in group["hooks"]
+        if "codex-tmux" in hook["command"] or "agent-tmux" in hook["command"]
+    )
+    state = json.loads(
+        (tmp_path / ".local/state/codex-tmux-integration/state.json").read_text()
+    )
+    assert state["schema"] == 2
 
     second = run(
         INSTALL,
@@ -92,6 +111,42 @@ def test_install_is_idempotent_and_preserves_unrelated_data(tmp_path):
     )
     assert second.returncode == 0, second.stderr
     assert "already up to date" in second.stdout
+
+
+def test_reinstalling_subset_removes_orphaned_links(tmp_path):
+    prepare_home(tmp_path)
+    installed = run(
+        INSTALL,
+        "--home",
+        tmp_path,
+        "--repo-root",
+        REPO_ROOT,
+        "--features",
+        "title-sync,window-attention,pane-logging",
+    )
+    assert installed.returncode == 0, installed.stderr
+    narrowed = run(
+        INSTALL,
+        "--home",
+        tmp_path,
+        "--repo-root",
+        REPO_ROOT,
+        "--features",
+        "title-sync",
+    )
+    assert narrowed.returncode == 0, narrowed.stderr
+    assert (tmp_path / ".local/bin/codex-tmux-title-sync").is_symlink()
+    assert not (tmp_path / ".local/bin/agent-tmux-notify").exists()
+    assert not (tmp_path / ".local/bin/tmux-autolog").exists()
+    state = json.loads(
+        (tmp_path / ".local/state/codex-tmux-integration/state.json").read_text()
+    )
+    assert state["enabled_features"] == ["title-sync"]
+    backups = list(
+        (tmp_path / ".local/state/codex-tmux-integration/backups").iterdir()
+    )
+    assert len(backups) == 2
+    assert len({path.name for path in backups}) == 2
 
 
 def test_single_feature_uninstall_keeps_other_features(tmp_path):
@@ -143,19 +198,38 @@ def test_full_uninstall_removes_only_managed_content(tmp_path):
     assert removed.returncode == 0, removed.stderr
     assert not (tmp_path / ".local/bin/codex-tmux-title-sync").exists()
     assert not (tmp_path / ".local/bin/agent_tmux_context.py").exists()
+    assert not (tmp_path / ".local/bin/codex-tmux-hook-manager").exists()
     assert "# >>> codex-tmux-integration >>>" not in (
         tmp_path / ".tmux.conf"
     ).read_text()
     assert "set -g mouse on" in (tmp_path / ".tmux.conf").read_text()
+    assert "set -g automatic-rename off" in (tmp_path / ".tmux.conf").read_text()
     assert "alias ll='ls -l'" in (tmp_path / ".zshrc").read_text()
     codex = json.loads((tmp_path / ".codex/hooks.json").read_text())
     claude = json.loads((tmp_path / ".claude/settings.json").read_text())
-    assert claude["env"]["SECRET"] == "keep"
+    assert claude["env"]["SETTING"] == "keep"
     assert any(
-        hook["command"] == "/home/example/.codex/xbrd/quota.sh"
+        hook["command"] == "/opt/user/quota.sh"
         for group in codex["hooks"]["Stop"]
         for hook in group["hooks"]
     )
+    assert not (tmp_path / ".local/state/codex-tmux-integration/state.json").exists()
+
+
+def test_non_tmux_feature_does_not_add_empty_tmux_or_shell_blocks(tmp_path):
+    prepare_home(tmp_path)
+    installed = run(
+        INSTALL,
+        "--home",
+        tmp_path,
+        "--repo-root",
+        REPO_ROOT,
+        "--features",
+        "external-notifications",
+    )
+    assert installed.returncode == 0, installed.stderr
+    assert "# >>> codex-tmux-integration >>>" not in (tmp_path / ".tmux.conf").read_text()
+    assert "# >>> codex-tmux-integration >>>" not in (tmp_path / ".zshrc").read_text()
 
 
 def test_notification_backend_is_stored_in_private_local_config(tmp_path):

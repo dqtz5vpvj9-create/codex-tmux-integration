@@ -1,138 +1,185 @@
-#!/bin/bash
-# Browse bounded logs written by tmux-autolog across every local tmux server.
+#!/usr/bin/env python3
+"""List and open bounded logs across default and registered tmux sockets."""
 
-set -u
+from __future__ import annotations
 
-LOGDIR="${TMUX_PANE_LOGDIR:-$HOME/.cache/tmux-pane-logs}"
-BASE="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
 
-strip_ansi() {
-  sed -E '
-    s/\x1b\[[0-9;?]*[ -/]*[@-~]//g;
-    s/\x1b\][^\x07\x1b]*(\x07|\x1b\\)//g;
-    s/\x1b[()=>][AB012]?//g;
-    s/\r$//
-  '
-}
+REPO_ROOT = Path(__file__).resolve().parents[3]
+RUNTIME_ROOT = REPO_ROOT / "shared" / "tmux-runtime"
+if str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
 
-server_key() {
-  local socket="$1" name hash
-  name=$(basename -- "$socket")
-  name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_')
-  hash=$(printf '%s' "$socket" | sha256sum | cut -c1-12)
-  printf '%s-%s\n' "${name:-default}" "$hash"
-}
+from tmux_runtime import live_sockets, server_pid, socket_from_tmux_env  # noqa: E402
 
-log_file() {
-  local socket="$1" pane="$2"
-  printf '%s/%s/%s.log\n' "$LOGDIR" "$(server_key "$socket")" "${pane#%}"
-}
+LOGDIR = Path(os.environ.get("TMUX_PANE_LOGDIR", Path.home() / ".cache/tmux-pane-logs"))
+ANSI_RE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()=>][AB012]?)")
 
-collect_sockets() {
-  find "$BASE" -maxdepth 1 -type s -print0 2>/dev/null
-}
 
-list_panes() {
-  printf '%-22s %-36s %-7s %-12s %-9s %s\n' SERVER WINDOW PANE COMMAND SIZE FILE
-  while IFS= read -r -d '' socket; do
-    local label
-    label=$(basename -- "$socket")
-    while IFS=$'\t' read -r wname pane cmd; do
-      [ -n "$pane" ] || continue
-      local file size
-      file=$(log_file "$socket" "$pane")
-      if [ -f "$file" ]; then
-        size=$(numfmt --to=iec-i --suffix=B "$(stat -c%s "$file")" 2>/dev/null)
-      else
-        size=-
-        file=-
-      fi
-      printf '%-22.22s %-36.36s %-7s %-12.12s %-9s %s\n' "$label" "$wname" "$pane" "$cmd" "$size" "$file"
-    done < <(tmux -S "$socket" list-panes -a -F '#{window_name}'$'\t''#{pane_id}'$'\t''#{pane_current_command}' 2>/dev/null)
-  done < <(collect_sockets)
-}
+def safe_key(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or ""))
 
-resolve_query() {
-  local query="$1" requested_server="" requested_value="$query"
-  local -a match_sockets=() match_panes=()
 
-  if [[ "$query" == *:%* ]]; then
-    requested_server="${query%%:%*}"
-    requested_value="%${query#*:%}"
-  fi
+def server_key(socket: str, pid: int) -> str:
+    digest = hashlib.sha256(f"{socket}\0{pid}".encode()).hexdigest()[:12]
+    return f"{safe_key(Path(socket).name)}-{pid}-{digest}"
 
-  while IFS= read -r -d '' socket; do
-    local label
-    label=$(basename -- "$socket")
-    [ -n "$requested_server" ] && [ "$requested_server" != "$label" ] && continue
-    if [ -z "$requested_server" ] && [[ "$requested_value" == %* ]] && [ -n "${TMUX:-}" ]; then
-      [ "$socket" != "${TMUX%%,*}" ] && continue
-    fi
-    while IFS=$'\t' read -r wname pane; do
-      [ -n "$pane" ] || continue
-      if { [[ "$requested_value" == %* ]] && [ "$pane" = "$requested_value" ]; } || \
-         { [[ "$requested_value" != %* ]] && [[ "$wname" == *"$requested_value"* ]]; }; then
-        match_sockets+=("$socket")
-        match_panes+=("$pane")
-      fi
-    done < <(tmux -S "$socket" list-panes -a -F '#{window_name}'$'\t''#{pane_id}' 2>/dev/null)
-  done < <(collect_sockets)
 
-  if [ "${#match_panes[@]}" -eq 0 ]; then
-    echo "no match for: $query" >&2
-    return 1
-  fi
-  if [ "${#match_panes[@]}" -gt 1 ]; then
-    echo "ambiguous match for '$query'; use server:%pane:" >&2
-    local i
-    for ((i=0; i<${#match_panes[@]}; i++)); do
-      printf '  %s:%s\n' "$(basename -- "${match_sockets[$i]}")" "${match_panes[$i]}" >&2
-    done
-    return 2
-  fi
-  RESOLVED_SOCKET="${match_sockets[0]}"
-  RESOLVED_PANE="${match_panes[0]}"
-}
+def log_file(socket: str, pane: str) -> Path:
+    return LOGDIR / server_key(socket, server_pid(socket)) / f"{pane.removeprefix('%')}.log"
 
-view_file() {
-  local file="$1" raw="$2" follow="$3"
-  if [ ! -f "$file" ]; then
-    echo "no log file: $file" >&2
-    return 1
-  fi
-  if [ "$follow" = 1 ]; then
-    if [ "$raw" = 1 ]; then tail -F "$file"; else tail -F "$file" | strip_ansi; fi
-  elif [ "$raw" = 1 ]; then
-    less -R +G "$file"
-  else
-    strip_ansi < "$file" | less +G
-  fi
-}
 
-raw=0
-follow=0
-query=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -r|--raw) raw=1 ;;
-    -f|--follow) follow=1 ;;
-    -h|--help)
-      sed -n '2,2p' "$0" | sed 's/^# //'
-      printf 'usage: tlog [-r] [-f] [server:%%pane|%%pane|window-substring]\n'
-      exit 0
-      ;;
-    -l|--list) ;;
-    *) query="$1" ;;
-  esac
-  shift
-done
+def tmux(socket: str, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["tmux", "-S", socket, *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
 
-if [ -z "$query" ]; then
-  list_panes
-  exit 0
-fi
 
-RESOLVED_SOCKET=""
-RESOLVED_PANE=""
-resolve_query "$query" || exit $?
-view_file "$(log_file "$RESOLVED_SOCKET" "$RESOLVED_PANE")" "$raw" "$follow"
+def panes() -> list[dict[str, str]]:
+    rows = []
+    for socket in live_sockets():
+        raw = tmux(
+            socket,
+            "list-panes",
+            "-a",
+            "-F",
+            "#{window_name}\t#{pane_id}\t#{pane_current_command}",
+        )
+        for line in raw.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                rows.append(
+                    {
+                        "socket": socket,
+                        "server": Path(socket).name,
+                        "window": parts[0],
+                        "pane": parts[1],
+                        "command": parts[2],
+                    }
+                )
+    return rows
+
+
+def list_logs() -> None:
+    print(f"{'SERVER':22} {'WINDOW':36} {'PANE':7} {'COMMAND':12} {'SIZE':10} FILE")
+    for row in panes():
+        path = log_file(row["socket"], row["pane"])
+        size = str(path.stat().st_size) if path.is_file() else "-"
+        file_text = str(path) if path.is_file() else "-"
+        print(
+            f"{row['server'][:22]:22} {row['window'][:36]:36} {row['pane']:7} "
+            f"{row['command'][:12]:12} {size:10} {file_text}"
+        )
+
+
+def resolve(query: str) -> dict[str, str]:
+    requested_server = ""
+    requested_value = query
+    if ":%" in query:
+        requested_server, pane_number = query.split(":%", 1)
+        requested_value = f"%{pane_number}"
+    current_socket = socket_from_tmux_env()
+    matches = []
+    for row in panes():
+        if requested_server and row["server"] != requested_server:
+            continue
+        if not requested_server and requested_value.startswith("%") and current_socket:
+            if row["socket"] != current_socket:
+                continue
+        if requested_value.startswith("%"):
+            matched = row["pane"] == requested_value
+        else:
+            matched = requested_value in row["window"]
+        if matched:
+            matches.append(row)
+    if not matches:
+        raise SystemExit(f"no match for: {query}")
+    if len(matches) > 1:
+        choices = "\n".join(f"  {row['server']}:{row['pane']}" for row in matches)
+        raise SystemExit(f"ambiguous match for {query!r}; use server:%pane:\n{choices}")
+    return matches[0]
+
+
+def stripped_stream(path: Path):
+    with path.open("rb") as stream:
+        for line in stream:
+            yield ANSI_RE.sub(b"", line).replace(b"\r\n", b"\n")
+
+
+def view(path: Path, raw: bool, follow: bool) -> None:
+    if not path.is_file():
+        raise SystemExit(f"no log file: {path}")
+    if follow:
+        command = ["tail", "-F", str(path)]
+        if raw:
+            raise SystemExit(subprocess.call(command))
+        process = subprocess.Popen(command, stdout=subprocess.PIPE)
+        assert process.stdout is not None
+        try:
+            for line in process.stdout:
+                sys.stdout.buffer.write(ANSI_RE.sub(b"", line))
+                sys.stdout.buffer.flush()
+        finally:
+            process.terminate()
+        return
+    pager = shutil.which("less")
+    if pager:
+        pager_args = [pager]
+        if raw:
+            pager_args.append("-R")
+        pager_args.append("+G")
+        process = subprocess.Popen(pager_args, stdin=subprocess.PIPE)
+        assert process.stdin is not None
+        if raw:
+            with path.open("rb") as stream:
+                shutil.copyfileobj(stream, process.stdin)
+        else:
+            for line in stripped_stream(path):
+                process.stdin.write(line)
+        process.stdin.close()
+        process.wait()
+    elif raw:
+        sys.stdout.buffer.write(path.read_bytes())
+    else:
+        for line in stripped_stream(path):
+            sys.stdout.buffer.write(line)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("query", nargs="?")
+    parser.add_argument("-r", "--raw", action="store_true")
+    parser.add_argument("-f", "--follow", action="store_true")
+    parser.add_argument("-l", "--list", action="store_true")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.list or not args.query:
+        list_logs()
+        return 0
+    row = resolve(args.query)
+    view(log_file(row["socket"], row["pane"]), args.raw, args.follow)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

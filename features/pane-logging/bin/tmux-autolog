@@ -1,73 +1,354 @@
-#!/bin/bash
-# Enable collision-free, bounded per-pane logs for the current tmux server.
+#!/usr/bin/env python3
+"""Enable and remove marker-owned bounded logging for tmux panes."""
 
-set -u
-umask 077
+from __future__ import annotations
 
-LOGDIR="${TMUX_PANE_LOGDIR:-$HOME/.cache/tmux-pane-logs}"
-if [ -n "${TMUX_PANE_LOG_SINK:-}" ]; then
-  SINK="$TMUX_PANE_LOG_SINK"
-elif command -v tmux-log-sink >/dev/null 2>&1; then
-  SINK="$(command -v tmux-log-sink)"
-else
-  SINK="$HOME/.local/bin/tmux-log-sink"
-fi
-SOCKET=""
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
 
-if [ "${1:-}" = "--socket" ]; then
-  SOCKET="${2:-}"
-  shift 2
-fi
-if [ -z "$SOCKET" ] && [ -n "${TMUX:-}" ]; then
-  SOCKET="${TMUX%%,*}"
-fi
+REPO_ROOT = Path(__file__).resolve().parents[3]
+RUNTIME_ROOT = REPO_ROOT / "shared" / "tmux-runtime"
+if str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
 
-tmux_cmd=(tmux)
-[ -n "$SOCKET" ] && tmux_cmd+=(-S "$SOCKET")
+from tmux_runtime import register_socket, server_pid, socket_from_tmux_env  # noqa: E402
 
-server_key() {
-  local socket="${SOCKET:-default}" name hash
-  name=$(basename -- "$socket")
-  name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_')
-  hash=$(printf '%s' "$socket" | sha256sum | cut -c1-12)
-  printf '%s-%s\n' "${name:-default}" "$hash"
-}
+TMUX_TIMEOUT_SECONDS = 1.0
+MARKER_OPTION = "@codex_tmux_pipe"
+LOGDIR = Path(os.environ.get("TMUX_PANE_LOGDIR", Path.home() / ".cache/tmux-pane-logs"))
 
-SERVER_KEY=$(server_key)
-SERVER_LOGDIR="$LOGDIR/$SERVER_KEY"
-mkdir -p "$SERVER_LOGDIR" || exit 0
-chmod 700 "$LOGDIR" "$SERVER_LOGDIR" 2>/dev/null || true
 
-enable_on() {
-  local pane="$1" already id logfile window pipe_command
-  [ -z "$pane" ] && return 0
-  already=$("${tmux_cmd[@]}" display-message -p -t "$pane" '#{pane_pipe}' 2>/dev/null)
-  [ "$already" = "1" ] && return 0
+def safe_key(value: Any) -> str:
+    import re
 
-  id="${pane#%}"
-  logfile="$SERVER_LOGDIR/${id}.log"
-  window=$("${tmux_cmd[@]}" display-message -p -t "$pane" '#{window_name}' 2>/dev/null)
-  {
-    printf '\n===== pipe-pane enabled %s server=%s pane=%s window=%s =====\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "$SERVER_KEY" "$pane" "$window"
-    "${tmux_cmd[@]}" capture-pane -e -p -S - -t "$pane" 2>/dev/null
-  } | "$SINK" "$logfile"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or ""))
 
-  printf -v pipe_command "exec %q %q" "$SINK" "$logfile"
-  "${tmux_cmd[@]}" pipe-pane -t "$pane" -o "$pipe_command" 2>/dev/null
-}
 
-case "${1:-sweep}" in
-  sweep)
-    while IFS= read -r pane; do
-      enable_on "$pane"
-    done < <("${tmux_cmd[@]}" list-panes -a -F '#{pane_id}' 2>/dev/null)
-    ;;
-  pane)
-    enable_on "${2:-}"
-    ;;
-  *)
-    echo "usage: $0 [--socket PATH] [sweep|pane <pane_id>]" >&2
-    exit 2
-    ;;
-esac
+def server_key(socket: str, pid: int) -> str:
+    digest = hashlib.sha256(f"{socket}\0{pid}".encode()).hexdigest()[:12]
+    return f"{safe_key(Path(socket).name)}-{pid}-{digest}"
+
+
+def legacy_server_key(socket: str) -> str:
+    digest = hashlib.sha256(socket.encode()).hexdigest()[:12]
+    return f"{safe_key(Path(socket).name)}-{digest}"
+
+
+def sink_path() -> Path:
+    configured = os.environ.get("TMUX_PANE_LOG_SINK")
+    if configured:
+        return Path(configured).expanduser()
+    found = shutil_which("tmux-log-sink")
+    return Path(found) if found else Path.home() / ".local/bin/tmux-log-sink"
+
+
+def shutil_which(command: str) -> str | None:
+    import shutil
+
+    return shutil.which(command)
+
+
+def tmux_result(socket: str, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["tmux", "-S", socket, *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=TMUX_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def tmux(socket: str, *args: str) -> str:
+    result = tmux_result(socket, *args)
+    if result is None or result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def pane_info(socket: str, pane: str) -> dict[str, Any] | None:
+    raw = tmux(
+        socket,
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{pane_id}\t#{pane_pipe}\t#{window_name}",
+    )
+    parts = raw.split("\t")
+    if len(parts) != 3 or parts[0] != pane:
+        return None
+    return {"pane": pane, "pipe": parts[1] == "1", "window": parts[2]}
+
+
+def marker(socket: str, pane: str) -> dict[str, Any] | None:
+    raw = tmux(socket, "show-options", "-pqv", "-t", pane, MARKER_OPTION)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def set_marker(socket: str, pane: str, value: dict[str, Any]) -> None:
+    tmux_result(
+        socket,
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        MARKER_OPTION,
+        json.dumps(value, separators=(",", ":")),
+    )
+
+
+def unset_marker(socket: str, pane: str) -> None:
+    tmux_result(socket, "set-option", "-pu", "-t", pane, MARKER_OPTION)
+
+
+def _sink_process_matches(pid: int, logfile: str) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        parts = [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+    except OSError:
+        try:
+            check = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=False,
+            )
+            parts = shlex.split(check.stdout) if check.returncode == 0 else []
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            parts = []
+    return any(Path(part).name == "tmux-log-sink" for part in parts) and logfile in parts
+
+
+def close_owned_pipe(socket: str, pane: str) -> bool:
+    info = pane_info(socket, pane)
+    owned = marker(socket, pane)
+    if info is None or owned is None:
+        return False
+    pid_file = Path(str(owned.get("pid_file") or ""))
+    logfile = str(owned.get("logfile") or "")
+    try:
+        sink_pid = int(pid_file.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        sink_pid = -1
+    if info["pipe"] and _sink_process_matches(sink_pid, logfile):
+        tmux_result(socket, "pipe-pane", "-t", pane)
+    unset_marker(socket, pane)
+    return True
+
+
+def _wait_for(path: Path, timeout: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.02)
+    return path.exists()
+
+
+def _write_snapshot(socket: str, pane: str, window: str, logfile: Path, sink: Path) -> None:
+    captured = tmux_result(socket, "capture-pane", "-e", "-p", "-S", "-", "-t", pane)
+    payload = (
+        f"\n===== history snapshot {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"pane={pane} window={window} =====\n"
+    ).encode()
+    if captured is not None and captured.returncode == 0:
+        payload += captured.stdout.encode(errors="replace")
+    try:
+        subprocess.run(
+            [str(sink), "--snapshot", str(logfile)],
+            input=payload,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        pass
+
+
+def enable_on(socket: str, pane: str) -> bool:
+    pid = server_pid(socket)
+    info = pane_info(socket, pane)
+    if pid <= 0 or info is None:
+        return False
+    owned = marker(socket, pane)
+    if info["pipe"]:
+        return owned is not None
+    if owned is not None:
+        unset_marker(socket, pane)
+
+    key = server_key(socket, pid)
+    logdir = LOGDIR / key
+    logdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(LOGDIR, 0o700)
+    os.chmod(logdir, 0o700)
+    logfile = logdir / f"{pane.removeprefix('%')}.log"
+    runtime_dir = logdir / ".runtime"
+    runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    token = f"{safe_key(pane)}-{os.getpid()}-{time.time_ns()}"
+    ready = runtime_dir / f"{token}.ready"
+    release = runtime_dir / f"{token}.release"
+    pid_file = runtime_dir / f"{safe_key(pane)}.pid"
+    sink = sink_path()
+
+    words = [
+        "env",
+        "CODEX_TMUX_PIPE=pane-logging",
+        str(sink),
+        "--live",
+        "--ready",
+        str(ready),
+        "--release",
+        str(release),
+        "--pid-file",
+        str(pid_file),
+        str(logfile),
+    ]
+    pipe_command = "exec " + shlex.join(words)
+    result = tmux_result(socket, "pipe-pane", "-t", pane, "-o", pipe_command)
+    if result is None or result.returncode != 0:
+        return False
+    set_marker(
+        socket,
+        pane,
+        {
+            "version": 2,
+            "server_pid": pid,
+            "server_key": key,
+            "logfile": str(logfile),
+            "pid_file": str(pid_file),
+        },
+    )
+    _wait_for(ready)
+    _write_snapshot(socket, pane, info["window"], logfile, sink)
+    release.touch()
+    release.chmod(0o600)
+    register_socket(socket, pid)
+    return True
+
+
+def list_panes(socket: str) -> list[str]:
+    return [
+        line.strip()
+        for line in tmux(socket, "list-panes", "-a", "-F", "#{pane_id}").splitlines()
+        if line.strip()
+    ]
+
+
+
+
+def _find_sink_pid(logfile: str) -> int:
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        parts = [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+        if any(Path(part).name == "tmux-log-sink" for part in parts) and logfile in parts:
+            return int(entry.name)
+    try:
+        check = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return -1
+    if check.returncode == 0:
+        for line in check.stdout.splitlines():
+            pid_text, _, command = line.strip().partition(" ")
+            if "tmux-log-sink" in command and logfile in command:
+                try:
+                    return int(pid_text)
+                except ValueError:
+                    pass
+    return -1
+
+
+def migrate(socket: str) -> int:
+    migrated = 0
+    old_root = LOGDIR / legacy_server_key(socket)
+    for pane in list_panes(socket):
+        info = pane_info(socket, pane)
+        if info is None or not info["pipe"] or marker(socket, pane) is not None:
+            continue
+        legacy_log = old_root / f"{pane.removeprefix('%')}.log"
+        sink_pid = _find_sink_pid(str(legacy_log))
+        if sink_pid <= 0:
+            continue
+        tmux_result(socket, "pipe-pane", "-t", pane)
+        if enable_on(socket, pane):
+            migrated += 1
+    return migrated
+
+
+def sweep(socket: str) -> int:
+    return sum(enable_on(socket, pane) for pane in list_panes(socket))
+
+
+def cleanup(socket: str) -> int:
+    return sum(close_owned_pipe(socket, pane) for pane in list_panes(socket))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--socket")
+    subparsers = parser.add_subparsers(dest="operation")
+    subparsers.add_parser("sweep")
+    pane = subparsers.add_parser("pane")
+    pane.add_argument("pane_id")
+    subparsers.add_parser("cleanup")
+    subparsers.add_parser("migrate")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    socket = args.socket or socket_from_tmux_env()
+    if not socket:
+        return 0
+    operation = args.operation or "sweep"
+    if operation == "sweep":
+        sweep(socket)
+    elif operation == "pane":
+        enable_on(socket, args.pane_id)
+    elif operation == "cleanup":
+        cleanup(socket)
+    else:
+        migrate(socket)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/codex-tmux-title-sync",
+            "command": "env CODEX_TMUX_INTEGRATION=title-sync {{BIN_DIR}}/codex-tmux-title-sync",
             "timeout": 3
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/codex-tmux-title-sync",
+            "command": "env CODEX_TMUX_INTEGRATION=title-sync {{BIN_DIR}}/codex-tmux-title-sync",
             "timeout": 3
           }
         ]
@@ -27,7 +27,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{BIN_DIR}}/codex-tmux-title-sync",
+            "command": "env CODEX_TMUX_INTEGRATION=title-sync {{BIN_DIR}}/codex-tmux-title-sync",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env CODEX_TMUX_INTEGRATION=title-sync {{BIN_DIR}}/codex-tmux-title-sync",
             "timeout": 3
           }
         ]

@@ -1,34 +1,41 @@
 # Architecture
 
-The repository is divided by user-visible behavior, not by file type.
+The repository is divided by user-visible behavior. Each feature may own a
+manifest, commands, lifecycle hook fragments, tmux or shell configuration,
+tests, and documentation.
 
-Each `features/<name>` directory may contain:
+## Verified hook routing
 
-- a `feature.json` install manifest;
-- commands under `bin/` or adapters under `adapters/`;
-- Codex and Claude hook fragments under `hooks/`;
-- tmux or shell configuration owned by that feature;
-- feature-local tests and a README.
-
-Only hook-to-pane resolution is shared because both title synchronization and
-window attention require exactly the same routing invariant.
-
-## Routing invariant
-
-The stable identity of a pane is:
+A pane identity includes:
 
 ```text
-tmux socket path + pane id
+tmux socket path + tmux server PID + pane ID + pane PID
 ```
 
-The pane id alone is insufficient because every tmux server has its own pane
-id namespace. Hook handlers first use inherited `TMUX` and `TMUX_PANE`; when
-Codex omits those values in a hook subprocess, the resolver correlates
-`session_id` or `transcript_path` with the live Codex process.
+Hook subprocesses first use inherited `TMUX` and `TMUX_PANE`, followed by a live
+tmux probe. When those variables are absent, the resolver correlates the hook
+session or normalized transcript path with live Codex processes, supports a
+custom `CODEX_HOME`, excludes app-server processes, and rejects equal-scoring
+matches in different panes.
+
+Process-backed cache entries also include the process start time, preventing a
+reused PID from validating stale state.
+
+## Runtime ownership
+
+Tmux hooks are array entries. A shared hook manager appends entries containing a
+feature marker and removes only entries carrying the same marker. No fixed
+array index is reserved.
+
+Window title and attention features maintain reversible state per tmux server
+lifetime. Pane logging combines a pane marker with a verified sink process.
+Install and uninstall apply or remove this runtime state on every live socket in
+the private registry.
 
 ## Configuration ownership
 
-The repository does not own complete user dotfiles. The installer generates
-aggregate files and places one marked source block in `.tmux.conf` and
-`.zshrc`. JSON hooks are merged by executable identity while all unrelated
-fields are preserved.
+The repository owns one marked source block in each applicable dotfile. JSON
+hooks carry an environment assignment identifying the owning feature. Legacy
+unmarked commands are migrated only when their complete executable path equals
+the installation bin directory; an unrelated command with the same basename is
+preserved.

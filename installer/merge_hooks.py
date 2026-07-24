@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge feature-owned Codex/Claude hooks without touching unrelated settings."""
+"""Merge marker-owned Codex and Claude hooks without claiming user commands."""
 
 from __future__ import annotations
 
@@ -14,15 +14,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
-
+OWNERSHIP_PREFIX = "CODEX_TMUX_INTEGRATION="
 MANAGED_EXECUTABLES = {
     "agent-tmux-notify",
     "claude-tmux-notify-wrapper",
     "codex-tmux-notify-wrapper",
     "codex-tmux-title-sync",
-    # Legacy commands replaced during the first migration.
-    "codex_hook_wrapper.sh",
-    "hook_wrapper.sh",
 }
 
 
@@ -35,28 +32,56 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def command_executable(command: Any) -> str:
+def command_words(command: Any) -> list[str]:
     if not isinstance(command, str) or not command.strip():
-        return ""
+        return []
     try:
-        parts = shlex.split(command)
+        return shlex.split(command)
     except ValueError:
-        parts = command.split()
+        return command.split()
+
+
+def command_executable(command: Any) -> str:
+    parts = command_words(command)
     if not parts:
         return ""
-    executable = parts[0]
-    if executable in {"bash", "sh", "zsh"} and len(parts) > 1:
-        executable = parts[1]
-    return Path(executable).name
+    index = 0
+    if parts[0] == "env":
+        index = 1
+        while index < len(parts) and "=" in parts[index] and not parts[index].startswith("/"):
+            index += 1
+    if index >= len(parts):
+        return ""
+    executable = parts[index]
+    if Path(executable).name in {"bash", "sh", "zsh"} and index + 1 < len(parts):
+        executable = parts[index + 1]
+    return executable
 
 
-def is_managed_hook(hook: Any) -> bool:
+def _normalized_path(value: str) -> str:
+    return os.path.abspath(os.path.expanduser(value))
+
+
+def is_managed_hook(hook: Any, replacements: dict[str, str] | None = None) -> bool:
     if not isinstance(hook, dict):
         return False
-    return command_executable(hook.get("command")) in MANAGED_EXECUTABLES
+    command = hook.get("command")
+    words = command_words(command)
+    if any(word.startswith(OWNERSHIP_PREFIX) for word in words):
+        return True
+    if not replacements or not replacements.get("BIN_DIR"):
+        return False
+    executable = command_executable(command)
+    if not executable or Path(executable).name not in MANAGED_EXECUTABLES:
+        return False
+    expected = _normalized_path(str(Path(replacements["BIN_DIR"]) / Path(executable).name))
+    return _normalized_path(executable) == expected
 
 
-def remove_managed_hooks(document: dict[str, Any]) -> dict[str, Any]:
+def remove_managed_hooks(
+    document: dict[str, Any],
+    replacements: dict[str, str] | None = None,
+) -> dict[str, Any]:
     result = copy.deepcopy(document)
     events = result.get("hooks")
     if not isinstance(events, dict):
@@ -77,14 +102,13 @@ def remove_managed_hooks(document: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(hooks, list):
                 cleaned_groups.append(group)
                 continue
-            kept_hooks = [hook for hook in hooks if not is_managed_hook(hook)]
+            kept_hooks = [
+                hook for hook in hooks if not is_managed_hook(hook, replacements)
+            ]
             if kept_hooks:
                 new_group = copy.deepcopy(group)
                 new_group["hooks"] = kept_hooks
                 cleaned_groups.append(new_group)
-            elif any(key != "hooks" for key in group):
-                # Matcher-only groups have no effect and are safe to omit.
-                continue
         if cleaned_groups:
             cleaned_events[event] = cleaned_groups
     result["hooks"] = cleaned_events
@@ -108,7 +132,7 @@ def apply_fragments(
     fragments: Iterable[dict[str, Any]],
     replacements: dict[str, str],
 ) -> dict[str, Any]:
-    result = remove_managed_hooks(document)
+    result = remove_managed_hooks(document, replacements)
     target_events = result.setdefault("hooks", {})
     if not isinstance(target_events, dict):
         raise ValueError("target hooks value must be an object")
@@ -150,9 +174,9 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     old_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     payload = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -194,13 +218,10 @@ def main() -> int:
             before, load_fragments(args.fragment), replacements
         )
     else:
-        after = remove_managed_hooks(before)
+        after = remove_managed_hooks(before, replacements)
 
     diff = hooks_diff(before, after, str(args.config))
-    if diff:
-        print(diff)
-    else:
-        print(f"{args.config}: hooks already up to date")
+    print(diff or f"{args.config}: hooks already up to date")
     if not args.dry_run and before != after:
         atomic_write_json(args.config, after)
     return 0

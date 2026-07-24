@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Bounded binary sink for one tmux pipe-pane stream."""
+"""Concurrent, bounded sink for tmux pipe-pane and history snapshots."""
 
+from __future__ import annotations
+
+import argparse
+import fcntl
 import os
-import sys
+import select
+import time
 from pathlib import Path
 
 DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_BACKUPS = 3
+DEFAULT_PENDING_BYTES = 8 * 1024 * 1024
 CHUNK_SIZE = 64 * 1024
+HANDSHAKE_TIMEOUT_SECONDS = 2.0
 
 
-def positive_int(name, default):
+def positive_int(name: str, default: int) -> int:
     try:
         value = int(os.environ.get(name, default))
     except (TypeError, ValueError):
@@ -18,66 +25,154 @@ def positive_int(name, default):
     return value if value > 0 else default
 
 
-def rotate(path, backups):
-    try:
-        oldest = path.with_name(f"{path.name}.{backups}")
-        oldest.unlink(missing_ok=True)
-        for index in range(backups - 1, 0, -1):
-            source = path.with_name(f"{path.name}.{index}")
-            if source.exists():
-                source.replace(path.with_name(f"{path.name}.{index + 1}"))
-        if path.exists():
-            path.replace(path.with_name(f"{path.name}.1"))
-    except OSError:
-        pass
+def rotate(path: Path, backups: int) -> None:
+    oldest = path.with_name(f"{path.name}.{backups}")
+    oldest.unlink(missing_ok=True)
+    for index in range(backups - 1, 0, -1):
+        source = path.with_name(f"{path.name}.{index}")
+        if source.exists():
+            source.replace(path.with_name(f"{path.name}.{index + 1}"))
+    if path.exists():
+        path.replace(path.with_name(f"{path.name}.1"))
 
 
-def main():
-    if len(sys.argv) != 2:
-        return 2
-    path = Path(sys.argv[1]).expanduser()
-    max_bytes = positive_int("TMUX_PANE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES)
-    backups = positive_int("TMUX_PANE_LOG_BACKUPS", DEFAULT_BACKUPS)
-    try:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        return 1
-
-    input_fd = sys.stdin.fileno()
-    handle = None
-    size = 0
-    try:
-        while True:
-            # os.read returns the bytes currently available from pipe-pane;
-            # BufferedReader.read(size) may wait for a full 64 KiB buffer.
-            chunk = os.read(input_fd, CHUNK_SIZE)
-            if not chunk:
-                break
-            if handle is None:
+def _write_locked(path: Path, data: bytes, max_bytes: int, backups: int) -> None:
+    if not data:
+        return
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+b") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            offset = 0
+            while offset < len(data):
                 try:
                     size = path.stat().st_size
                 except OSError:
                     size = 0
-                if size and size + len(chunk) > max_bytes:
+                if size >= max_bytes:
                     rotate(path, backups)
                     size = 0
-                handle = path.open("ab", buffering=0)
-                os.chmod(path, 0o600)
-            elif size and size + len(chunk) > max_bytes:
-                handle.close()
-                rotate(path, backups)
-                handle = path.open("ab", buffering=0)
-                os.chmod(path, 0o600)
-                size = 0
-            handle.write(chunk)
-            size += len(chunk)
+                writable = max_bytes - size
+                part = data[offset : offset + writable]
+                with path.open("ab", buffering=0) as stream:
+                    os.chmod(path, 0o600)
+                    stream.write(part)
+                offset += len(part)
+                if offset < len(data):
+                    rotate(path, backups)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _prepare(path: Path) -> bool:
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        return True
+    except OSError:
+        return False
+
+
+def _write_pid_file(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(f"{os.getpid()}\n", encoding="ascii")
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _touch(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.touch()
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def stream_snapshot(path: Path, max_bytes: int, backups: int) -> int:
+    input_fd = 0
+    try:
+        while True:
+            chunk = os.read(input_fd, CHUNK_SIZE)
+            if not chunk:
+                break
+            _write_locked(path, chunk, max_bytes, backups)
+    except (BrokenPipeError, OSError):
+        return 1
+    return 0
+
+
+def stream_live(
+    path: Path,
+    max_bytes: int,
+    backups: int,
+    ready: Path | None,
+    release: Path | None,
+    pid_file: Path | None,
+) -> int:
+    input_fd = 0
+    pending_limit = positive_int("TMUX_PANE_LOG_PENDING_BYTES", DEFAULT_PENDING_BYTES)
+    pending = bytearray()
+    _write_pid_file(pid_file)
+    _touch(ready)
+    deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
+    try:
+        while release is not None and not release.exists() and time.monotonic() < deadline:
+            readable, _, _ = select.select([input_fd], [], [], 0.05)
+            if not readable:
+                continue
+            chunk = os.read(input_fd, CHUNK_SIZE)
+            if not chunk:
+                break
+            pending.extend(chunk)
+            if len(pending) >= pending_limit:
+                _write_locked(path, bytes(pending), max_bytes, backups)
+                pending.clear()
+        if pending:
+            _write_locked(path, bytes(pending), max_bytes, backups)
+        while True:
+            chunk = os.read(input_fd, CHUNK_SIZE)
+            if not chunk:
+                break
+            _write_locked(path, chunk, max_bytes, backups)
     except (BrokenPipeError, OSError):
         return 1
     finally:
-        if handle is not None:
-            handle.close()
+        if pid_file is not None:
+            pid_file.unlink(missing_ok=True)
+        if ready is not None:
+            ready.unlink(missing_ok=True)
     return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", type=Path)
+    parser.add_argument("--snapshot", action="store_true")
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--ready", type=Path)
+    parser.add_argument("--release", type=Path)
+    parser.add_argument("--pid-file", type=Path)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    path = args.path.expanduser()
+    if not _prepare(path):
+        return 1
+    max_bytes = positive_int("TMUX_PANE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES)
+    backups = positive_int("TMUX_PANE_LOG_BACKUPS", DEFAULT_BACKUPS)
+    if args.live:
+        return stream_live(path, max_bytes, backups, args.ready, args.release, args.pid_file)
+    return stream_snapshot(path, max_bytes, backups)
 
 
 if __name__ == "__main__":

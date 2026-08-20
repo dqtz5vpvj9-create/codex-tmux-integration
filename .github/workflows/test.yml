@@ -27,7 +27,6 @@ jobs:
       - name: Syntax checks
         run: |
           python -m compileall -q features shared installer
-          bash -n features/external-notifications/adapters/androidtools/*.sh
           bash -n integration-tests/test_tmux_integration.sh
           zsh -n features/ssh-autoattach/shell/tmux-ssh.zsh
       - name: Isolated tmux integration

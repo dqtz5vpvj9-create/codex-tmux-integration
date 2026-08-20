@@ -87,7 +87,7 @@ def test_marker_owned_wrapper_is_removed_independent_of_path():
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "env CODEX_TMUX_INTEGRATION=external-notifications /some/wrapper stop",
+                            "command": "env CODEX_TMUX_INTEGRATION=window-attention /some/wrapper stop",
                         },
                         {"type": "command", "command": "/opt/keep"},
                     ]

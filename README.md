@@ -12,7 +12,6 @@ fragment, tmux or shell configuration, tests, and documentation.
 | `window-attention` | Highlight inactive windows when an agent stops or needs input, then restore the previous style. |
 | `pane-logging` | Capture bounded logs per server lifetime and pane; browse them with `tlog`. |
 | `ssh-autoattach` | Select a server and session on interactive SSH login. |
-| `external-notifications` | Optionally forward hooks to a user-configured notification backend. |
 
 The shared `tmux-context` component resolves a hook to a verified
 `socket path + server PID + pane ID`. Equal-scoring matches in different panes
@@ -68,7 +67,7 @@ that belonged to features no longer selected.
 ## Uninstall
 
 ```bash
-./installer/uninstall --features external-notifications
+./installer/uninstall --features title-sync
 ./installer/uninstall
 ```
 
@@ -76,24 +75,17 @@ Uninstall restores managed window names and styles, removes marker-owned tmux
 hooks, closes verified project-owned logging pipes, and preserves unrelated
 configuration.
 
-## Optional notification backend
-
-`external-notifications` has no host-specific backend by default. Configure a
-local queue without committing its path:
-
-```bash
-./installer/install \
-  --notification-queue /path/to/notification_queue.py \
-  --notification-python /path/to/python3
-```
-
-The values are stored with mode `0600` under
-`~/.config/codex-tmux-integration/notifications.env`. Environment variables
-`ANDROIDTOOLS_NOTIFY_QUEUE` and `ANDROIDTOOLS_NOTIFY_PYTHON` take precedence.
-Missing notification infrastructure does not disable the tmux features.
-
 Do not commit generated hook payloads, pane logs, user configuration, state
-manifests, transcripts, or notification backend settings. See `PRIVACY.md`.
+manifests, or transcripts. See `PRIVACY.md`.
+
+## Notification hooks
+
+Cross-platform Codex / Claude / DSH notification hooks (Linux bash wrappers,
+Windows notify_launcher, DSH PowerShell scripts) now live in the separate
+[`codex-notification-hooks`](https://github.com/dqtz5vpvj9-create/codex-notification-hooks)
+repository. Configure Codex/Claude hook paths directly at that repo's wrappers
+(chris: submodule under `androidtools/hooks/`; Windows: standalone clone plus
+`windows/install-codex-hook-windows.ps1`).
 
 ## Validation
 

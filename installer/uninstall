@@ -178,7 +178,7 @@ def main() -> int:
             str(target): str(source) for target, source in remaining_links.items()
         }
         state["config"] = {}
-        for path in (tmux_aggregate, shell_aggregate, config_root / "notifications.env"):
+        for path in (tmux_aggregate, shell_aggregate):
             if path.exists():
                 state["config"][str(path)] = install.sha256(path)
         atomic_write_json(state_path, state)

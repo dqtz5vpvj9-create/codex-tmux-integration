@@ -9,7 +9,6 @@ import importlib.util
 import json
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -29,7 +28,6 @@ ALL_FEATURES = (
     "window-attention",
     "pane-logging",
     "ssh-autoattach",
-    "external-notifications",
 )
 TMUX_FEATURES = {"title-sync", "window-attention", "pane-logging"}
 LEGACY_HOOKS = {
@@ -63,8 +61,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repo-root", type=Path, default=Path(__file__).resolve().parents[1]
     )
-    parser.add_argument("--notification-queue", type=Path)
-    parser.add_argument("--notification-python", type=Path)
     return parser.parse_args()
 
 
@@ -398,23 +394,6 @@ def reconcile_runtime(
     return messages
 
 
-def notification_config_text(args: argparse.Namespace) -> str | None:
-    if not args.notification_queue and not args.notification_python:
-        return None
-    lines = ["# Generated locally by codex-tmux-integration. Do not commit."]
-    if args.notification_queue:
-        lines.append(
-            "ANDROIDTOOLS_NOTIFY_QUEUE="
-            + shlex.quote(str(args.notification_queue.expanduser().resolve()))
-        )
-    if args.notification_python:
-        lines.append(
-            "ANDROIDTOOLS_NOTIFY_PYTHON="
-            + shlex.quote(str(args.notification_python.expanduser().resolve()))
-        )
-    return "\n".join(lines) + "\n"
-
-
 def main() -> int:
     args = parse_args()
     home = args.home.expanduser().resolve()
@@ -437,7 +416,6 @@ def main() -> int:
     zsh_main = home / ".zshrc"
     codex_hooks = home / ".codex" / "hooks.json"
     claude_settings = home / ".claude" / "settings.json"
-    notification_config = config_root / "notifications.env"
 
     tmux_text, shell_text = desired_aggregators(manifests)
     has_tmux = any(manifest.get("tmux") for _, manifest in manifests)
@@ -474,7 +452,6 @@ def main() -> int:
     stale_links = {
         target: source for target, source in previous_links.items() if target not in links
     }
-    private_notification_text = notification_config_text(args)
 
     changes: list[str] = []
     for target, source in links.items():
@@ -504,11 +481,6 @@ def main() -> int:
         changes.append(f"merge hooks in {codex_hooks}")
     if claude_before != claude_after:
         changes.append(f"merge hooks in {claude_settings}")
-    if private_notification_text is not None and (
-        not notification_config.exists()
-        or notification_config.read_text(encoding="utf-8") != private_notification_text
-    ):
-        changes.append(f"write private notification config {notification_config}")
 
     if changes:
         print("planned changes:")
@@ -548,7 +520,6 @@ def main() -> int:
             claude_settings,
             tmux_aggregate,
             shell_aggregate,
-            notification_config,
             *links.keys(),
             *stale_links.keys(),
         ],
@@ -570,8 +541,6 @@ def main() -> int:
     atomic_write_text(zsh_main, wanted_zsh_main)
     atomic_write_json(codex_hooks, codex_after)
     atomic_write_json(claude_settings, claude_after)
-    if private_notification_text is not None:
-        atomic_write_text(notification_config, private_notification_text, mode=0o600)
 
     runtime_messages = reconcile_runtime(
         home=home,
@@ -597,7 +566,7 @@ def main() -> int:
         "links": {str(target): str(source) for target, source in links.items()},
         "config": {},
     }
-    for path in (tmux_aggregate, shell_aggregate, notification_config):
+    for path in (tmux_aggregate, shell_aggregate):
         if path.exists():
             state["config"][str(path)] = sha256(path)
     atomic_write_json(state_path, state)

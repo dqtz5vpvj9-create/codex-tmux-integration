@@ -229,15 +229,6 @@ def main() -> int:
                 warning("pane logging ownership", f"{socket}: {len(missing)} panes use no managed pipe")
                 warnings += 1
 
-    if "external-notifications" in enabled:
-        config = home / ".config/codex-tmux-integration/notifications.env"
-        configured = config.is_file() or bool(os.environ.get("ANDROIDTOOLS_NOTIFY_QUEUE"))
-        if configured:
-            result("optional notification backend", True, str(config))
-        else:
-            warning("optional notification backend", "no local backend configured")
-            warnings += 1
-
     print(f"INFO live tmux servers - {len(live)}")
     print(f"SUMMARY errors={errors} warnings={warnings}")
     return 1 if errors else 0

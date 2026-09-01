@@ -1,0 +1,16 @@
+[package]
+name = "tmux-ssh-picker"
+version = "0.1.0"
+edition = "2021"
+description = "Session picker for SSH logins: agent sessions only, touch-aware, auto-attaches after a countdown."
+
+# No dependencies on purpose.  This runs on every SSH login, so it must build
+# with a bare `rustc` and must not pay for anything it does not need.  The
+# handful of libc calls are declared directly in src/main.rs.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

@@ -22,6 +22,92 @@ __tmux_ssh_valid_name() {
   fi
 }
 
+__tmux_ssh_reconnect_id() {
+  emulate -L zsh
+  local id="${TMUX_SSH_RECONNECT_ID:-}"
+
+  [[ "$id" =~ '^[A-Fa-f0-9]{32}$' ]] || return 1
+  print -r -- "${(L)id}"
+}
+
+__tmux_ssh_reconnect_dir() {
+  emulate -L zsh
+  local root
+
+  if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    root="$XDG_RUNTIME_DIR/codex-tmux-integration"
+  else
+    root="${TMPDIR:-/tmp}/codex-tmux-integration-$(id -u)"
+  fi
+  print -r -- "$root/ssh-reconnect"
+}
+
+__tmux_ssh_remember_target() {
+  emulate -L zsh
+  local socket="$1" session="$2"
+  local id dir file tmp
+
+  id="$(__tmux_ssh_reconnect_id)" || return 0
+  [[ "$socket" == /* ]] || return 1
+  [[ "$socket" != *$'\n'* ]] || return 1
+  __tmux_ssh_valid_name session "$session" || return 1
+
+  dir="$(__tmux_ssh_reconnect_dir)"
+  file="$dir/$id"
+  tmp="$dir/.$id.$$.${RANDOM:-0}"
+
+  umask 077
+  command mkdir -p -- "$dir" || return 1
+  command chmod 700 -- "$dir" || return 1
+  {
+    print -r -- "$socket"
+    print -r -- "$session"
+  } >| "$tmp" || {
+    command rm -f -- "$tmp"
+    return 1
+  }
+  command chmod 600 -- "$tmp" || {
+    command rm -f -- "$tmp"
+    return 1
+  }
+  command mv -f -- "$tmp" "$file"
+}
+
+__tmux_ssh_try_reconnect() {
+  emulate -L zsh
+  local id dir file socket session extra
+
+  id="$(__tmux_ssh_reconnect_id)" || return 1
+  dir="$(__tmux_ssh_reconnect_dir)"
+  file="$dir/$id"
+  [[ -f "$file" ]] || return 1
+
+  socket=''
+  session=''
+  extra=''
+  {
+    IFS= read -r socket
+    IFS= read -r session
+    IFS= read -r extra
+  } < "$file"
+
+  if [[ "$socket" != /* ]] ||
+     [[ "$socket" == *$'\n'* ]] ||
+     [[ -n "$extra" ]] ||
+     ! __tmux_ssh_valid_name session "$session"; then
+    command rm -f -- "$file"
+    return 1
+  fi
+
+  if ! tmux -S "$socket" has-session -t "$session" 2>/dev/null; then
+    command rm -f -- "$file"
+    return 1
+  fi
+
+  print -r -- "tmux: reconnecting ${socket:t}:${session}"
+  exec tmux -S "$socket" attach-session -t "$session"
+}
+
 __tmux_ssh_attach_target() {
   emulate -L zsh
   local target="${1:-}"
@@ -45,6 +131,7 @@ __tmux_ssh_attach_target() {
   fi
   __tmux_ssh_valid_name session "$session" || return 2
   socket="$(__tmux_ssh_socket_path "$server")"
+  __tmux_ssh_remember_target "$socket" "$session" || return 2
   print -r -- "tmux: attaching ${server}:${session}"
   exec tmux -S "$socket" new-session -A -s "$session"
 }
@@ -64,10 +151,50 @@ __tmux_ssh_new_session() {
   __tmux_ssh_valid_name session "$session" || return 2
 
   socket="$(__tmux_ssh_socket_path "$server")"
+  __tmux_ssh_remember_target "$socket" "$session" || return 2
   exec tmux -S "$socket" new-session -A -s "$session"
 }
 
+
+# The picker lists only sessions someone is working in, adapts to a phone
+# screen, takes taps, and attaches to the most recently active session after a
+# short countdown.  Anything unexpected -- missing binary, no tty, a session
+# name the caller would refuse -- falls through to the whiptail menu below, so
+# a broken picker can never strand an SSH login.
 __tmux_ssh_menu() {
+  emulate -L zsh
+  local bin out rc socket session
+
+  bin="${TMUX_SSH_PICKER:-$HOME/.local/bin/tmux-ssh-picker}"
+  if [[ -x "$bin" && "${TERM:-}" != dumb ]]; then
+    out="$("$bin")"
+    rc=$?
+    if (( rc == 0 )); then
+      case "$out" in
+        ATTACH$'\t'*)
+          socket="${${out#ATTACH$'\t'}%%$'\t'*}"
+          session="${out##*$'\t'}"
+          if [[ "$socket" == /* ]] && __tmux_ssh_valid_name session "$session"; then
+            __tmux_ssh_remember_target "$socket" "$session" || return 2
+            print -r -- "tmux: attaching ${socket:t}:${session}"
+            exec tmux -S "$socket" attach-session -t "$session"
+          fi
+          ;;
+        NEW)
+          __tmux_ssh_new_session
+          return
+          ;;
+        SHELL)
+          return 0
+          ;;
+      esac
+    fi
+  fi
+
+  __tmux_ssh_menu_fallback
+}
+
+__tmux_ssh_menu_fallback() {
   emulate -L zsh
   local base="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
   local socket session windows attached label pick i
@@ -87,8 +214,10 @@ __tmux_ssh_menu() {
   fi
 
   if (( ${#labels[@]} == 0 )); then
+    socket="$(__tmux_ssh_socket_path default)"
     print -r -- 'tmux: no live sessions found; creating default:agent'
-    exec tmux -S "$(__tmux_ssh_socket_path default)" new-session -A -s agent
+    __tmux_ssh_remember_target "$socket" agent || return 2
+    exec tmux -S "$socket" new-session -A -s agent
   fi
 
   if command -v whiptail >/dev/null 2>&1 && [[ "${TERM:-}" != "dumb" ]]; then
@@ -111,6 +240,9 @@ __tmux_ssh_menu() {
   case "$pick" in
     <->)
       if (( pick >= 1 && pick <= ${#labels[@]} )); then
+        __tmux_ssh_remember_target \
+          "${action_sockets[$pick]}" \
+          "${action_sessions[$pick]}" || return 2
         exec tmux -S "${action_sockets[$pick]}" attach-session -t "${action_sessions[$pick]}"
       fi
       ;;
@@ -140,6 +272,8 @@ __tmux_ssh_autoattach() {
 
   if [[ -n "$TMUX_SSH_TARGET" || -n "$TMUX_SSH_SERVER" || -n "$TMUX_SSH_SOCKET" || -n "$TMUX_SSH_SESSION" ]]; then
     __tmux_ssh_attach_target "$TMUX_SSH_TARGET"
+  elif __tmux_ssh_try_reconnect; then
+    return 0
   else
     __tmux_ssh_menu
   fi

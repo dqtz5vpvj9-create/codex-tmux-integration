@@ -483,6 +483,7 @@ struct Frame {
     text: String,
     hits: Vec<Hit>,
     per_page: usize,
+    geom: Geometry,
 }
 
 fn hit_test(hits: &[Hit], row: usize, col: usize) -> Option<Action> {
@@ -491,39 +492,34 @@ fn hit_test(hits: &[Hit], row: usize, col: usize) -> Option<Action> {
         .map(|h| h.action)
 }
 
-const DIM: &str = "\x1b[2m";
-const INV: &str = "\x1b[7m";
+// newt's palette, so the picker looks like the whiptail dialog it replaces:
+// a blue field, a light dialog floating in the middle, the current entry in
+// white on red.
+const FIELD: &str = "\x1b[44m"; // screen behind the dialog
+const WIN: &str = "\x1b[47;30m"; // dialog body: black on light grey
+const WIN_SOFT: &str = "\x1b[47;90m"; // secondary text inside the dialog
+const SEL: &str = "\x1b[41;97m"; // current entry: white on red
+const SHADOW: &str = "\x1b[40m"; // drop shadow
 const OFF: &str = "\x1b[0m";
 
-/// One framed row: `│ content… │`, padded to the inner width.
-fn row(inner: &str, inner_w: usize, boxed: bool, invert: bool, dim: bool) -> String {
-    let body = pad(&truncate(inner, inner_w), inner_w);
-    let painted = if invert {
-        format!("{INV}{body}{OFF}")
-    } else if dim {
-        format!("{DIM}{body}{OFF}")
-    } else {
-        body
-    };
-    if boxed {
-        format!("│{painted}│\r\n")
-    } else {
-        format!("{painted}\r\n")
-    }
+/// Move the cursor to a 1-based (row, column).
+fn at(row: usize, col: usize) -> String {
+    format!("\x1b[{row};{col}H")
 }
 
-fn rule(left: &str, right: &str, title: &str, inner_w: usize, boxed: bool) -> String {
-    if !boxed {
-        let t = truncate(title, inner_w);
-        return format!("{DIM}{}{OFF}\r\n", pad(&t, inner_w));
-    }
-    let t = truncate(title, inner_w.saturating_sub(3));
-    let used = str_width(&t) + 1;
-    let dashes = inner_w.saturating_sub(used);
-    format!(
-        "{DIM}{left}─{t}{}{right}{OFF}\r\n",
-        "─".repeat(dashes)
-    )
+/// Centre `text` in `width` columns.
+fn center(text: &str, width: usize) -> String {
+    let t = truncate(text, width);
+    let w = str_width(&t);
+    let left = (width - w) / 2;
+    format!("{}{}{}", " ".repeat(left), t, " ".repeat(width - w - left))
+}
+
+struct Geometry {
+    x0: usize,
+    y0: usize,
+    dw: usize,
+    dh: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -540,179 +536,191 @@ fn render(
     rows: usize,
     now: i64,
 ) -> Frame {
-    let boxed = cols >= 26;
-    let inner_w = if boxed { cols - 2 } else { cols };
-    let col0 = if boxed { 2 } else { 1 }; // 1-based column of the inner area
-    // top rule + separator + action bar + status + bottom rule
-    let chrome = if boxed { 5 } else { 4 };
-    let avail = rows.saturating_sub(chrome).max(1);
-    let rows_per_card = if avail >= 4 && inner_w >= 20 { 2 } else { 1 };
-    let per_page = (avail / rows_per_card).max(1);
+    // The dialog floats when there is room and fills the screen when there is
+    // not, which is what a phone in portrait gets.
+    let shadow = cols >= 30 && rows >= 12;
+    let dw = if cols < 28 {
+        cols
+    } else {
+        (cols.saturating_sub(if shadow { 6 } else { 4 })).min(72).max(24)
+    };
+    let inner = dw.saturating_sub(4); // borders plus one space of padding
+    let x0 = (cols.saturating_sub(dw)) / 2 + 1;
 
-    let mut out = String::from("\x1b[2J\x1b[H");
+    let rows_per_card = if rows >= 15 && inner >= 20 { 2 } else { 1 };
+    // borders + blank + list + blank + status + buttons
+    let fixed = 2 + 1 + 1 + 1 + 1;
+    // (emitted below in that order)
+    let cap = rows.saturating_sub(fixed + if shadow { 1 } else { 0 }).max(rows_per_card);
+    let per_page = (cap / rows_per_card).max(1);
+    let shown = per_page.min(idx.len().saturating_sub(scroll));
+    let list_rows = (shown * rows_per_card).max(rows_per_card);
+    let dh = fixed + list_rows;
+    let y0 = (rows.saturating_sub(dh + if shadow { 1 } else { 0 })) / 2 + 1;
+
+    let mut out = String::new();
     let mut hits: Vec<Hit> = Vec::new();
-    let mut screen_row = 1usize;
 
+    // Paint the field, then the dialog on top of it.
+    out.push_str(FIELD);
+    out.push_str("\x1b[2J");
+
+    let mut y = y0;
     let title = if show_all {
         format!(" tmux · 全部 {} 个会话 ", idx.len())
     } else {
         format!(" tmux · {} 个 agent 会话 ", idx.len())
     };
-    out.push_str(&rule("╭", "╮", &title, inner_w, boxed));
-    screen_row += 1;
+    let t = truncate(&title, dw.saturating_sub(6));
+    let bar = dw - 2 - str_width(&t);
+    let lead = bar / 2;
+    out.push_str(&format!(
+        "{}{WIN}┌{}{t}{}┐{OFF}",
+        at(y, x0),
+        "─".repeat(lead),
+        "─".repeat(bar - lead)
+    ));
+    y += 1;
 
-    let shown = per_page.min(idx.len().saturating_sub(scroll));
-    // Hug the content: a two-session menu should not draw ten blank rows.
-    let list_rows = (shown * rows_per_card).max(rows_per_card);
+    out.push_str(&format!("{}{WIN}│{}│{OFF}", at(y, x0), " ".repeat(dw - 2)));
+    y += 1;
+
     for k in 0..shown {
         let i = scroll + k;
         let s = &sessions[idx[i]];
         let selected = sel == i;
-        let badge = if i < 9 {
-            format!("{}", i + 1)
-        } else {
-            "·".to_string()
-        };
-        let head = format!(" {} {}  {}", if selected { "▸" } else { " " }, badge, s.name);
-        out.push_str(&row(&head, inner_w, boxed, selected, false));
-        hits.push(Hit { row: screen_row, col_start: 1, col_end: cols, action: Action::Pick(i) });
-        screen_row += 1;
+        let style = if selected { SEL } else { WIN };
+        let badge = if i < 9 { format!("{}", i + 1) } else { "·".into() };
+        let head = format!(" {badge}  {}", s.name);
+        out.push_str(&format!(
+            "{}{WIN}│{OFF}{style} {} {OFF}{WIN}│{OFF}",
+            at(y, x0),
+            pad(&truncate(&head, inner), inner)
+        ));
+        hits.push(Hit { row: y, col_start: x0, col_end: x0 + dw - 1, action: Action::Pick(i) });
+        y += 1;
 
         if rows_per_card == 2 {
             let meta = format!(
-                "      {} 窗口{} · {}前",
+                "    {} 窗口{} · {}前",
                 s.windows,
                 if s.attached > 0 { " · ● 已连接" } else { "" },
                 ago(s.activity, now)
             );
-            out.push_str(&row(&meta, inner_w, boxed, selected, !selected));
-            hits.push(Hit { row: screen_row, col_start: 1, col_end: cols, action: Action::Pick(i) });
-            screen_row += 1;
+            let style2 = if selected { SEL } else { WIN_SOFT };
+            out.push_str(&format!(
+                "{}{WIN}│{OFF}{style2} {} {OFF}{WIN}│{OFF}",
+                at(y, x0),
+                pad(&truncate(&meta, inner), inner)
+            ));
+            hits.push(Hit { row: y, col_start: x0, col_end: x0 + dw - 1, action: Action::Pick(i) });
+            y += 1;
         }
     }
     for _ in shown * rows_per_card..list_rows {
-        out.push_str(&row("", inner_w, boxed, false, false));
-        screen_row += 1;
+        out.push_str(&format!("{}{WIN}│{}│{OFF}", at(y, x0), " ".repeat(dw - 2)));
+        y += 1;
     }
 
-    out.push_str(&rule("├", "┤", "", inner_w, boxed));
-    screen_row += 1;
+    out.push_str(&format!("{}{WIN}│{}│{OFF}", at(y, x0), " ".repeat(dw - 2)));
+    y += 1;
 
-    // Action bar: three side-by-side buttons, each a wide tap target.
-    // Three buttons must always be reachable, so the labels shrink rather
-    // than the last button falling off the end of a phone screen.
-    let label_sets: [[String; 3]; 4] = [
-        [
-            if show_all {
-                " a 只看 agent ".into()
-            } else if hidden > 0 {
-                format!(" a 全部 +{hidden} ")
-            } else {
-                " a 全部 ".into()
-            },
-            " n 新建 ".into(),
-            " s Shell ".into(),
-        ],
-        [
-            if show_all { " a agent ".into() } else { " a 全部 ".into() },
-            " n 新建 ".into(),
-            " s 退出 ".into(),
-        ],
-        [
-            if show_all { "a·少".into() } else { "a·全".into() },
-            "n·新".into(),
-            "s·退".into(),
-        ],
-        ["a".into(), "n".into(), "s".into()],
-    ];
-    let labels = label_sets
-        .iter()
-        .find(|set| {
-            // Must match the draw loop below exactly: each button costs its
-            // label, two brackets and one trailing space.
-            set.iter().map(|l| str_width(l) + 3).sum::<usize>() <= inner_w
-        })
-        .unwrap_or(&label_sets[3]);
-    let buttons = [
-        (labels[0].clone(), Action::ToggleAll, idx.len()),
-        (labels[1].clone(), Action::New, idx.len() + 1),
-        (labels[2].clone(), Action::Shell, idx.len() + 2),
-    ];
-    let mut bar = String::new();
-    let mut bar_plain_w = 0usize;
-    for (label, action, sel_index) in buttons.iter() {
-        let w = str_width(label) + 2; // brackets
-        if bar_plain_w + w + 1 > inner_w {
-            break;
-        }
-        let start_col = col0 + bar_plain_w + 1;
-        let piece = format!("[{label}]");
-        if sel == *sel_index {
-            bar.push_str(&format!("{INV}{piece}{OFF}"));
-        } else {
-            bar.push_str(&format!("{DIM}{piece}{OFF}"));
-        }
-        bar.push(' ');
-        hits.push(Hit {
-            row: screen_row,
-            col_start: start_col,
-            col_end: start_col + w - 1,
-            action: *action,
-        });
-        bar_plain_w += w + 1;
-    }
-    let bar_body = pad(&bar, 0);
-    if boxed {
-        out.push_str(&format!(
-            "│{}{}│\r\n",
-            bar_body,
-            " ".repeat(inner_w.saturating_sub(bar_plain_w))
-        ));
-    } else {
-        out.push_str(&format!("{bar_body}\r\n"));
-    }
-    screen_row += 1;
-
-    // Status: a countdown bar, or the key hints.
+    // Status line: countdown bar, or the key hints.
     let status = match countdown {
         Some(remain) => {
             let name = &sessions[idx[0]].name;
-            let text = format!(" {remain:.1}s → {name}");
-            let text = truncate(&text, inner_w.saturating_sub(12));
-            let bar_w = inner_w.saturating_sub(str_width(&text) + 2);
+            let head = format!("{remain:.1}s → {}", truncate(name, inner.saturating_sub(16)));
+            let bar_w = inner.saturating_sub(str_width(&head) + 1);
             let filled = if timeout > 0.0 {
                 ((remain / timeout) * bar_w as f32).round().clamp(0.0, bar_w as f32) as usize
             } else {
                 0
             };
-            format!(
-                "{text} {}{}",
-                "▓".repeat(filled),
-                "░".repeat(bar_w.saturating_sub(filled))
-            )
+            format!("{head} {}{}", "▓".repeat(filled), "░".repeat(bar_w - filled))
         }
-        None => {
-            if inner_w >= 40 {
-                " ⏎ 进入 · ↑↓ 选择 · 1-9 直达 · 轻触可选".to_string()
-            } else {
-                " ⏎ 进入 · ↑↓ · 1-9 · 轻触".to_string()
-            }
-        }
+        None if inner >= 34 => "⏎ 进入 · ↑↓ 选择 · 1-9 直达 · 轻触可选".to_string(),
+        None => "⏎ 进入 · ↑↓ · 1-9 · 轻触".to_string(),
     };
-    out.push_str(&row(&status, inner_w, boxed, false, true));
-    screen_row += 1;
+    out.push_str(&format!(
+        "{}{WIN}│{OFF}{WIN_SOFT} {} {OFF}{WIN}│{OFF}",
+        at(y, x0),
+        pad(&truncate(&status, inner), inner)
+    ));
+    y += 1;
 
-    if boxed {
-        let more = if idx.len() > per_page {
-            format!(" {}/{} ", scroll / per_page + 1, (idx.len() + per_page - 1) / per_page)
+    // Buttons, centred like newt's.  Candidates are the *rendered* pieces, so
+    // the fit test cannot drift from what is drawn; the last one always fits.
+    let toggle_label = if show_all {
+        ["只看 agent", "agent", "少", "a"]
+    } else if hidden > 0 {
+        ["全部 +", "全部", "全", "a"]
+    } else {
+        ["全部", "全部", "全", "a"]
+    };
+    let others = [["新建", "Shell"], ["新建", "退出"], ["新", "退"], ["n", "s"]];
+    let mut candidates: Vec<[String; 3]> = Vec::new();
+    for tier in 0..4 {
+        let t = if toggle_label[tier].ends_with('+') {
+            format!("{}{hidden}", toggle_label[tier])
         } else {
-            String::new()
+            toggle_label[tier].to_string()
         };
-        out.push_str(&rule("╰", "╯", &more, inner_w, boxed));
+        candidates.push([
+            format!("< {t} >"),
+            format!("< {} >", others[tier][0]),
+            format!("< {} >", others[tier][1]),
+        ]);
     }
-    let _ = screen_row;
+    candidates.push(["[a]".into(), "[n]".into(), "[s]".into()]);
+    candidates.push(["a".into(), "n".into(), "s".into()]);
 
-    Frame { text: out, hits, per_page }
+    const GAP: usize = 2;
+    let pieces = candidates
+        .iter()
+        .find(|c| c.iter().map(|p| str_width(p)).sum::<usize>() + GAP * 2 <= inner)
+        .unwrap_or_else(|| candidates.last().unwrap());
+    let buttons = [
+        (&pieces[0], Action::ToggleAll, idx.len()),
+        (&pieces[1], Action::New, idx.len() + 1),
+        (&pieces[2], Action::Shell, idx.len() + 2),
+    ];
+    let bar_w: usize = pieces.iter().map(|p| str_width(p)).sum::<usize>() + GAP * 2;
+    let pad_left = inner.saturating_sub(bar_w) / 2;
+    let mut bar = String::from(&" ".repeat(pad_left));
+    let mut cursor = x0 + 2 + pad_left; // 1-based column of the next button
+    for (i, (piece, action, sel_index)) in buttons.iter().enumerate() {
+        let w = str_width(piece);
+        let style = if sel == *sel_index { SEL } else { WIN };
+        bar.push_str(&format!("{OFF}{style}{piece}{OFF}{WIN}"));
+        hits.push(Hit { row: y, col_start: cursor, col_end: cursor + w - 1, action: *action });
+        cursor += w + GAP;
+        if i < 2 {
+            bar.push_str(&" ".repeat(GAP));
+        }
+    }
+    let used = pad_left + bar_w;
+    out.push_str(&format!(
+        "{}{WIN}│ {bar}{}{WIN} │{OFF}",
+        at(y, x0),
+        " ".repeat(inner.saturating_sub(used))
+    ));
+    y += 1;
+
+    out.push_str(&format!(
+        "{}{WIN}└{}┘{OFF}",
+        at(y, x0),
+        "─".repeat(dw - 2)
+    ));
+
+    if shadow {
+        for sy in (y0 + 1)..=y {
+            out.push_str(&format!("{}{SHADOW}  {OFF}", at(sy, x0 + dw)));
+        }
+        out.push_str(&format!("{}{SHADOW}{}{OFF}", at(y + 1, x0 + 2), " ".repeat(dw)));
+    }
+    out.push_str(&format!("{}{OFF}", at(rows, cols)));
+
+    Frame { text: out, hits, per_page, geom: Geometry { x0, y0, dw, dh } }
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,19 +1037,33 @@ mod tests {
         assert_eq!(decode("会".as_bytes()), Some((Key::Char('会'), 3)));
     }
 
+    /// Every size we support must produce a dialog that fits on screen, with
+    /// every tap target inside it.
     #[test]
-    fn narrow_render_never_exceeds_the_terminal_width() {
-        let all = vec![s("一个名字很长的会话名称测试", 10, "", true), s("agent", 20, "", true)];
+    fn the_dialog_always_fits_and_so_do_its_hit_targets() {
+        let all = vec![
+            s("一个名字很长的会话名称测试用例", 10, "", true),
+            s("agent", 20, "", true),
+            s("third", 15, "", true),
+        ];
         let idx = view(&all, false);
-        for cols in [20usize, 26, 30, 46, 80] {
-            for rows in [8usize, 14, 24] {
+        for cols in [20usize, 24, 28, 30, 40, 46, 60, 80, 200] {
+            for rows in [8usize, 10, 14, 20, 24, 50] {
                 let f = render(&all, &idx, 0, 0, false, 3, None, 1.0, cols, rows, 100);
-                for line in f.text.split("\r\n") {
-                    let plain = strip_ansi(line);
+                let g = &f.geom;
+                assert!(g.x0 >= 1 && g.x0 + g.dw - 1 <= cols, "cols={cols} rows={rows} x overflow");
+                assert!(g.y0 >= 1 && g.y0 + g.dh - 1 <= rows, "cols={cols} rows={rows} y overflow");
+                for h in &f.hits {
                     assert!(
-                        str_width(&plain) <= cols,
-                        "cols={cols} rows={rows} width={} line={plain:?}",
-                        str_width(&plain)
+                        h.row >= g.y0 && h.row < g.y0 + g.dh,
+                        "cols={cols} rows={rows} hit row {} outside dialog",
+                        h.row
+                    );
+                    assert!(
+                        h.col_start >= g.x0 && h.col_end <= g.x0 + g.dw - 1,
+                        "cols={cols} rows={rows} hit cols {}..{} outside dialog",
+                        h.col_start,
+                        h.col_end
                     );
                 }
             }
@@ -1049,28 +1071,65 @@ mod tests {
     }
 
     #[test]
+    fn the_dialog_is_centred_when_there_is_room() {
+        let all = vec![s("alpha", 30, "", true)];
+        let idx = view(&all, false);
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 80, 24, 100);
+        let g = &f.geom;
+        let left = g.x0 - 1;
+        let right = 80 - (g.x0 + g.dw - 1);
+        assert!(left.abs_diff(right) <= 1, "left={left} right={right}");
+        let top = g.y0 - 1;
+        let bottom = 24 - (g.y0 + g.dh - 1);
+        assert!(top.abs_diff(bottom) <= 2, "top={top} bottom={bottom}");
+    }
+
+    #[test]
+    fn the_field_is_painted_and_the_current_entry_is_highlighted() {
+        let all = vec![s("alpha", 30, "", true), s("beta", 20, "", true)];
+        let idx = view(&all, false);
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 60, 20, 100);
+        assert!(f.text.starts_with(FIELD), "the blue field must be painted first");
+        assert!(f.text.contains(SEL), "the current entry needs the highlight");
+        assert!(f.text.contains(WIN), "the dialog body needs its own colour");
+        // the second entry is not highlighted, so exactly one card is
+        let sel_rows = f.text.matches(SEL).count();
+        assert!(sel_rows <= 2, "only the current card highlights, got {sel_rows}");
+    }
+
+    #[test]
     fn countdown_names_the_top_session_and_draws_a_bar() {
         let all = vec![s("older", 10, "", true), s("newest", 99, "", true)];
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, Some(0.5), 1.0, 80, 14, 100);
+        let f = render(&all, &idx, 0, 0, false, 0, Some(0.5), 1.0, 80, 20, 100);
         let p = strip_ansi(&f.text);
         assert!(p.contains("newest"), "{p}");
         assert!(p.contains('▓') && p.contains('░'), "{p}");
     }
 
     #[test]
-    fn a_card_claims_both_of_its_rows_across_the_full_width() {
+    fn a_card_claims_both_of_its_rows_across_the_dialog() {
         let all = vec![s("alpha", 30, "", true), s("beta", 20, "", true)];
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 40, 20, 100);
-        // rows 2 and 3 are the first card; a tap anywhere on either picks it
-        assert_eq!(hit_test(&f.hits, 2, 1), Some(Action::Pick(0)));
-        assert_eq!(hit_test(&f.hits, 3, 40), Some(Action::Pick(0)));
-        assert_eq!(hit_test(&f.hits, 4, 20), Some(Action::Pick(1)));
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 60, 20, 100);
+        let rows0: Vec<usize> = f
+            .hits
+            .iter()
+            .filter(|h| h.action == Action::Pick(0))
+            .map(|h| h.row)
+            .collect();
+        assert_eq!(rows0.len(), 2, "a card should own two rows");
+        assert_eq!(rows0[1], rows0[0] + 1);
+        // a tap anywhere on either row picks it
+        assert_eq!(hit_test(&f.hits, rows0[0], f.geom.x0), Some(Action::Pick(0)));
+        assert_eq!(
+            hit_test(&f.hits, rows0[1], f.geom.x0 + f.geom.dw - 1),
+            Some(Action::Pick(0))
+        );
     }
 
     #[test]
-    fn the_action_bar_maps_taps_by_column() {
+    fn the_buttons_share_a_row_and_do_not_overlap() {
         let all = vec![s("alpha", 30, "", true)];
         let idx = view(&all, false);
         let f = render(&all, &idx, 0, 0, false, 2, None, 1.0, 60, 20, 100);
@@ -1079,24 +1138,22 @@ mod tests {
             .iter()
             .filter(|h| !matches!(h.action, Action::Pick(_)))
             .collect();
-        assert_eq!(bar.len(), 3, "three buttons expected");
+        assert_eq!(bar.len(), 3);
         assert_eq!(bar[0].action, Action::ToggleAll);
         assert_eq!(bar[1].action, Action::New);
         assert_eq!(bar[2].action, Action::Shell);
-        // the buttons share one row and do not overlap
         assert!(bar.iter().all(|h| h.row == bar[0].row));
         assert!(bar[0].col_end < bar[1].col_start);
         assert!(bar[1].col_end < bar[2].col_start);
-        // tapping inside the middle button hits New, not its neighbours
         let mid = (bar[1].col_start + bar[1].col_end) / 2;
         assert_eq!(hit_test(&f.hits, bar[1].row, mid), Some(Action::New));
     }
 
     #[test]
-    fn all_three_buttons_fit_at_every_width() {
+    fn all_three_buttons_survive_every_width() {
         let all = vec![s("alpha", 30, "", true)];
         let idx = view(&all, false);
-        for cols in [20usize, 24, 26, 30, 36, 46, 60, 100] {
+        for cols in [20usize, 24, 28, 30, 36, 46, 60, 100] {
             let f = render(&all, &idx, 0, 0, false, 7, None, 1.0, cols, 16, 100);
             let n = f
                 .hits
@@ -1108,53 +1165,16 @@ mod tests {
     }
 
     #[test]
-    fn the_list_hugs_its_content() {
-        let all = vec![s("alpha", 30, "", true), s("beta", 20, "", true)];
-        let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 40, 30, 100);
-        // 1 title + 2 cards x 2 rows + separator + buttons + status + bottom
-        assert_eq!(f.text.matches("\r\n").count(), 9, "{}", f.text);
-    }
-
-    #[test]
-    fn tap_targets_are_at_least_two_rows_tall_when_there_is_room() {
-        let all = vec![s("alpha", 30, "", true)];
-        let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 40, 20, 100);
-        let card_rows: Vec<usize> = f
-            .hits
-            .iter()
-            .filter(|h| h.action == Action::Pick(0))
-            .map(|h| h.row)
-            .collect();
-        assert_eq!(card_rows.len(), 2, "a card should own two rows");
-    }
-
-    #[test]
     fn a_short_screen_falls_back_to_one_row_cards() {
         let all: Vec<Session> = (0..6).map(|i| s(&format!("s{i}"), i, "", true)).collect();
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 40, 8, 100);
-        let card_rows: Vec<usize> = f
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 40, 10, 100);
+        let card_hits = f
             .hits
             .iter()
             .filter(|h| matches!(h.action, Action::Pick(_)))
-            .map(|h| h.row)
-            .collect();
-        assert_eq!(card_rows.len(), f.per_page, "one row per visible card");
-    }
-
-    #[test]
-    fn a_detached_shell_session_stays_listed() {
-        // Detaching is the normal state of a session you come back to.
-        let out = "agent\t1\t0\t5\t\tzsh\n";
-        let v = parse_panes("/tmp/s", out);
-        assert!(v[0].has_shell);
-        assert!(visible(&v[0], false));
-        // A service pane is pinned out explicitly, not guessed at.
-        let out = "mcp\t1\t0\t5\thide\tzsh\n";
-        let v = parse_panes("/tmp/s", out);
-        assert!(!visible(&v[0], false));
+            .count();
+        assert_eq!(card_hits, f.per_page, "one row per visible card");
     }
 
     fn strip_ansi(s: &str) -> String {

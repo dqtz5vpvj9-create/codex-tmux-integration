@@ -22,10 +22,29 @@ recently active session, so the common case costs one SSH round trip and no
 decisions. Any key or tap cancels the timer. `TMUX_SSH_MENU_TIMEOUT` sets the
 delay in seconds; `0` disables it.
 
-**Fits a phone and takes taps.** The layout adapts from 80 columns down to 20,
-dropping the frame and shrinking the button labels rather than losing a button.
-Each session owns two full-width rows, so a thumb does not have to be precise.
-Mouse reporting is SGR (`1000h`/`1006h`), which phone SSH clients send on tap.
+**Looks like the dialog it replaces.** newt's palette and geometry: a blue
+field, a light dialog centred on it with a drop shadow, the current entry in
+white on red, `< buttons >` centred along the bottom.
+
+```
+    ┌─────────────────── tmux · 2 个 agent 会话 ───────────────────┐
+    │                                                             │
+    │  1  agent-alpha                                             │
+    │     2 窗口 · ● 已连接 · 3m前                                 │
+    │  2  choreo_pixel4a_posttask_freeze_t8_c1_diagnostic_20260831 │
+    │     1 窗口 · 12m前                                           │
+    │                                                             │
+    │ 0.6s → agent-alpha ▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+    │           < 全部 +2 >  < 新建 >  < Shell >                   │
+    └─────────────────────────────────────────────────────────────┘
+```
+
+**Fits a phone and takes taps.** The dialog floats when there is room and fills
+the screen when there is not, from 80 columns down to 20. Button labels shrink
+through five tiers rather than a button falling off the end. Each session owns
+two full-width rows, so a thumb does not have to be precise; taps are
+hit-tested against the cards and against each button's own columns. Mouse
+reporting is SGR (`1000h`/`1006h`), which phone SSH clients send on tap.
 
 ## Keys
 
@@ -54,7 +73,7 @@ picker degrades the login; it cannot block it.
 ## Build
 
     ./build.sh              # installs to ~/.local/bin/tmux-ssh-picker
-    cargo test              # 21 unit tests
+    cargo test              # 20 unit tests
 
 No dependencies, deliberately: this runs on every SSH login. The few libc calls
 are declared in `src/main.rs`, so a bare `rustc src/main.rs` also works.

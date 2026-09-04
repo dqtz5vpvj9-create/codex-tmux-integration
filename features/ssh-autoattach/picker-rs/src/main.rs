@@ -178,6 +178,15 @@ fn str_width(s: &str) -> usize {
 }
 
 /// Truncate to `max` columns, marking the cut with an ellipsis.
+/// Set once at startup from the measured terminal, so `truncate` does not have
+/// to be threaded through every call site.
+// Defaults to the safe marker; startup replaces it once the terminal is known.
+static ELLIPSIS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new('~' as u32);
+
+fn ellipsis() -> char {
+    char::from_u32(ELLIPSIS.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or('~')
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -195,7 +204,7 @@ fn truncate(s: &str, max: usize) -> String {
         out.push(c);
         w += cw;
     }
-    out.push('…');
+    out.push(ellipsis());
     out
 }
 
@@ -492,6 +501,158 @@ fn hit_test(hits: &[Hit], row: usize, col: usize) -> Option<Action> {
         .map(|h| h.action)
 }
 
+/// Box drawing, arrows, dots and shade blocks are all East Asian *Ambiguous*:
+/// a terminal with a CJK font renders them two cells wide, and the layout tears
+/// because we counted one. Rather than guess, ask the terminal how wide it
+/// draws one of them, and fall back to ASCII when it says two.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Glyphs {
+    tl: char,
+    tr: char,
+    bl: char,
+    br: char,
+    h: char,
+    v: char,
+    tee_l: char,
+    tee_r: char,
+    sep: &'static str,
+    arrow: &'static str,
+    attached: &'static str,
+    bar_full: char,
+    bar_empty: char,
+    ellipsis: char,
+    hint_wide: &'static str,
+    hint_narrow: &'static str,
+}
+
+const UNICODE_GLYPHS: Glyphs = Glyphs {
+    tl: '┌',
+    tr: '┐',
+    bl: '└',
+    br: '┘',
+    h: '─',
+    v: '│',
+    tee_l: '├',
+    tee_r: '┤',
+    sep: " · ",
+    arrow: " → ",
+    attached: " · ● 已连接",
+    bar_full: '▓',
+    bar_empty: '░',
+    ellipsis: '…',
+    hint_wide: "⏎ 进入 · ↑↓ 选择 · 1-9 直达 · 轻触可选",
+    hint_narrow: "⏎ 进入 · ↑↓ · 1-9 · 轻触",
+};
+
+/// Every glyph here is unambiguously one cell wide in every terminal.
+const ASCII_GLYPHS: Glyphs = Glyphs {
+    tl: '+',
+    tr: '+',
+    bl: '+',
+    br: '+',
+    h: '-',
+    v: '|',
+    tee_l: '+',
+    tee_r: '+',
+    sep: " - ",
+    arrow: " -> ",
+    attached: " - * 已连接",
+    bar_full: '#',
+    bar_empty: '.',
+    ellipsis: '~',
+    hint_wide: "Enter 进入 - 上下选择 - 1-9 直达 - 轻触可选",
+    hint_narrow: "Enter 进入 - 1-9 - 轻触",
+};
+
+fn cache_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    let term = std::env::var("TERM").unwrap_or_else(|_| "unknown".into());
+    let term: String = term
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect();
+    Some(base.join("tmux-ssh-picker").join(format!("ambiguous-width-{term}")))
+}
+
+/// Ask the terminal how many cells it spends on an ambiguous character, by
+/// printing one at a known column and reading the cursor back.
+fn probe_ambiguous_width(fd: i32, w: &mut &File, r: &mut &File) -> Option<usize> {
+    let _ = w.write_all("\x1b[H─\x1b[6n".as_bytes());
+    let _ = w.flush();
+    let deadline = Instant::now() + Duration::from_millis(
+        std::env::var("TMUX_SSH_MENU_PROBE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600),
+    );
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
+        if left <= 0 {
+            return None;
+        }
+        if !wait_readable(fd, left) {
+            return None;
+        }
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        if let Some(w) = width_from_dsr(&buf) {
+            return Some(w);
+        }
+        if buf.len() > 64 {
+            return None;
+        }
+    }
+}
+
+/// The reply to `ESC[6n` is `ESC [ <row> ; <col> R`.  We printed one character
+/// at column 1, so the cursor now sits one past however wide it was drawn.
+fn width_from_dsr(buf: &[u8]) -> Option<usize> {
+    let end = buf.iter().position(|c| *c == b'R')?;
+    let text = String::from_utf8_lossy(&buf[..end]);
+    let col: usize = text.rsplit(';').next()?.parse().ok()?;
+    match col {
+        2 => Some(1),
+        3 => Some(2),
+        _ => None,
+    }
+}
+
+fn ambiguous_width(fd: i32, w: &mut &File, r: &mut &File) -> usize {
+    if let Ok(v) = std::env::var("TMUX_SSH_MENU_AMBIGUOUS") {
+        if let Ok(n) = v.parse() {
+            return n;
+        }
+    }
+    let path = cache_path();
+    if let Some(p) = &path {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            if let Ok(n) = text.trim().parse::<usize>() {
+                if n == 1 || n == 2 {
+                    return n;
+                }
+            }
+        }
+    }
+    // Unknown terminal: measure it once and remember the answer.  A terminal
+    // that will not answer is one we cannot measure, so take the layout-safe
+    // value -- and cache that too, or every login pays the probe timeout.
+    let answer = probe_ambiguous_width(fd, w, r).unwrap_or(2);
+    if let Some(p) = &path {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, format!("{answer}\n"));
+    }
+    answer
+}
+
 // newt's palette, so the picker looks like the whiptail dialog it replaces:
 // a blue field, a light dialog floating in the middle, the current entry in
 // white on red.
@@ -535,6 +696,7 @@ fn render(
     cols: usize,
     rows: usize,
     now: i64,
+    g: &Glyphs,
 ) -> Frame {
     // The dialog floats when there is room and fills the screen when there is
     // not, which is what a phone in portrait gets.
@@ -567,22 +729,24 @@ fn render(
 
     let mut y = y0;
     let title = if show_all {
-        format!(" tmux · 全部 {} 个会话 ", idx.len())
+        format!(" tmux{}全部 {} 个会话 ", g.sep, idx.len())
     } else {
-        format!(" tmux · {} 个 agent 会话 ", idx.len())
+        format!(" tmux{}{} 个 agent 会话 ", g.sep, idx.len())
     };
     let t = truncate(&title, dw.saturating_sub(6));
     let bar = dw - 2 - str_width(&t);
     let lead = bar / 2;
     out.push_str(&format!(
-        "{}{WIN}┌{}{t}{}┐{OFF}",
+        "{}{WIN}{}{}{t}{}{}{OFF}",
         at(y, x0),
-        "─".repeat(lead),
-        "─".repeat(bar - lead)
+        g.tl,
+        g.h.to_string().repeat(lead),
+        g.h.to_string().repeat(bar - lead),
+        g.tr
     ));
     y += 1;
 
-    out.push_str(&format!("{}{WIN}│{}│{OFF}", at(y, x0), " ".repeat(dw - 2)));
+    out.push_str(&format!("{}{WIN}{}{}{}{OFF}", at(y, x0), g.v, " ".repeat(dw - 2), g.v));
     y += 1;
 
     for k in 0..shown {
@@ -590,61 +754,76 @@ fn render(
         let s = &sessions[idx[i]];
         let selected = sel == i;
         let style = if selected { SEL } else { WIN };
-        let badge = if i < 9 { format!("{}", i + 1) } else { "·".into() };
+        let badge = if i < 9 { format!("{}", i + 1) } else { "*".to_string() };
         let head = format!(" {badge}  {}", s.name);
         out.push_str(&format!(
-            "{}{WIN}│{OFF}{style} {} {OFF}{WIN}│{OFF}",
+            "{}{WIN}{}{OFF}{style} {} {OFF}{WIN}{}{OFF}",
             at(y, x0),
-            pad(&truncate(&head, inner), inner)
+            g.v,
+            pad(&truncate(&head, inner), inner),
+            g.v
         ));
         hits.push(Hit { row: y, col_start: x0, col_end: x0 + dw - 1, action: Action::Pick(i) });
         y += 1;
 
         if rows_per_card == 2 {
             let meta = format!(
-                "    {} 窗口{} · {}前",
+                "    {} 窗口{}{}{}前",
                 s.windows,
-                if s.attached > 0 { " · ● 已连接" } else { "" },
+                if s.attached > 0 { g.attached } else { "" },
+                g.sep,
                 ago(s.activity, now)
             );
             let style2 = if selected { SEL } else { WIN_SOFT };
             out.push_str(&format!(
-                "{}{WIN}│{OFF}{style2} {} {OFF}{WIN}│{OFF}",
+                "{}{WIN}{}{OFF}{style2} {} {OFF}{WIN}{}{OFF}",
                 at(y, x0),
-                pad(&truncate(&meta, inner), inner)
+                g.v,
+                pad(&truncate(&meta, inner), inner),
+                g.v
             ));
             hits.push(Hit { row: y, col_start: x0, col_end: x0 + dw - 1, action: Action::Pick(i) });
             y += 1;
         }
     }
     for _ in shown * rows_per_card..list_rows {
-        out.push_str(&format!("{}{WIN}│{}│{OFF}", at(y, x0), " ".repeat(dw - 2)));
+        out.push_str(&format!("{}{WIN}{}{}{}{OFF}", at(y, x0), g.v, " ".repeat(dw - 2), g.v));
         y += 1;
     }
 
-    out.push_str(&format!("{}{WIN}│{}│{OFF}", at(y, x0), " ".repeat(dw - 2)));
+    out.push_str(&format!("{}{WIN}{}{}{}{OFF}", at(y, x0), g.v, " ".repeat(dw - 2), g.v));
     y += 1;
 
     // Status line: countdown bar, or the key hints.
     let status = match countdown {
         Some(remain) => {
             let name = &sessions[idx[0]].name;
-            let head = format!("{remain:.1}s → {}", truncate(name, inner.saturating_sub(16)));
+            let head = format!(
+                "{remain:.1}s{}{}",
+                g.arrow,
+                truncate(name, inner.saturating_sub(16))
+            );
             let bar_w = inner.saturating_sub(str_width(&head) + 1);
             let filled = if timeout > 0.0 {
                 ((remain / timeout) * bar_w as f32).round().clamp(0.0, bar_w as f32) as usize
             } else {
                 0
             };
-            format!("{head} {}{}", "▓".repeat(filled), "░".repeat(bar_w - filled))
+            format!(
+                "{head} {}{}",
+                g.bar_full.to_string().repeat(filled),
+                g.bar_empty.to_string().repeat(bar_w - filled)
+            )
         }
-        None if inner >= 34 => "⏎ 进入 · ↑↓ 选择 · 1-9 直达 · 轻触可选".to_string(),
-        None => "⏎ 进入 · ↑↓ · 1-9 · 轻触".to_string(),
+        None if inner >= 34 => g.hint_wide.to_string(),
+        None => g.hint_narrow.to_string(),
     };
     out.push_str(&format!(
-        "{}{WIN}│{OFF}{WIN_SOFT} {} {OFF}{WIN}│{OFF}",
+        "{}{WIN}{}{OFF}{WIN_SOFT} {} {OFF}{WIN}{}{OFF}",
         at(y, x0),
-        pad(&truncate(&status, inner), inner)
+        g.v,
+        pad(&truncate(&status, inner), inner),
+        g.v
     ));
     y += 1;
 
@@ -700,16 +879,20 @@ fn render(
     }
     let used = pad_left + bar_w;
     out.push_str(&format!(
-        "{}{WIN}│ {bar}{}{WIN} │{OFF}",
+        "{}{WIN}{} {bar}{}{WIN} {}{OFF}",
         at(y, x0),
-        " ".repeat(inner.saturating_sub(used))
+        g.v,
+        " ".repeat(inner.saturating_sub(used)),
+        g.v
     ));
     y += 1;
 
     out.push_str(&format!(
-        "{}{WIN}└{}┘{OFF}",
+        "{}{WIN}{}{}{}{OFF}",
         at(y, x0),
-        "─".repeat(dw - 2)
+        g.bl,
+        g.h.to_string().repeat(dw - 2),
+        g.br
     ));
 
     if shadow {
@@ -775,7 +958,18 @@ fn main() {
         Some(g) => g,
         None => std::process::exit(2),
     };
-    let _ = w.write_all(b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
+    let _ = w.write_all(b"\x1b[?1049h\x1b[?25l");
+    let _ = w.flush();
+
+    // Measure the terminal before drawing anything that depends on the answer.
+    let glyphs = if ambiguous_width(fd, &mut w, &mut r) == 1 {
+        &UNICODE_GLYPHS
+    } else {
+        &ASCII_GLYPHS
+    };
+    ELLIPSIS.store(glyphs.ellipsis as u32, std::sync::atomic::Ordering::Relaxed);
+
+    let _ = w.write_all(b"\x1b[?1000h\x1b[?1006h");
     let _ = w.flush();
 
     fn leave(w: &mut &File) {
@@ -808,7 +1002,7 @@ fn main() {
         // Probe the layout so the selection can be kept on screen.
         let probe = render(
             &sessions, &idx, sel, scroll, show_all, hidden, countdown, timeout, cols, rows,
-            now_unix(),
+            now_unix(), glyphs,
         );
         if sel < idx.len() {
             if sel < scroll {
@@ -819,7 +1013,7 @@ fn main() {
         }
         let frame = render(
             &sessions, &idx, sel, scroll, show_all, hidden, countdown, timeout, cols, rows,
-            now_unix(),
+            now_unix(), glyphs,
         );
         let _ = w.write_all(frame.text.as_bytes());
         let _ = w.flush();
@@ -1001,7 +1195,10 @@ mod tests {
     fn truncation_respects_columns() {
         assert_eq!(str_width(&truncate("会话名字很长", 5)), 5);
         assert_eq!(truncate("short", 10), "short");
-        assert!(truncate("abcdefgh", 4).ends_with('…'));
+        assert!(truncate("abcdefgh", 4).ends_with(ellipsis()));
+        // both markers are one cell, so the truncation arithmetic holds either way
+        assert_eq!(ch_width(UNICODE_GLYPHS.ellipsis), 1);
+        assert_eq!(ch_width(ASCII_GLYPHS.ellipsis), 1);
         assert_eq!(str_width(&truncate("abcdefgh", 4)), 4);
     }
 
@@ -1049,7 +1246,7 @@ mod tests {
         let idx = view(&all, false);
         for cols in [20usize, 24, 28, 30, 40, 46, 60, 80, 200] {
             for rows in [8usize, 10, 14, 20, 24, 50] {
-                let f = render(&all, &idx, 0, 0, false, 3, None, 1.0, cols, rows, 100);
+                let f = render(&all, &idx, 0, 0, false, 3, None, 1.0, cols, rows, 100, &UNICODE_GLYPHS);
                 let g = &f.geom;
                 assert!(g.x0 >= 1 && g.x0 + g.dw - 1 <= cols, "cols={cols} rows={rows} x overflow");
                 assert!(g.y0 >= 1 && g.y0 + g.dh - 1 <= rows, "cols={cols} rows={rows} y overflow");
@@ -1074,7 +1271,7 @@ mod tests {
     fn the_dialog_is_centred_when_there_is_room() {
         let all = vec![s("alpha", 30, "", true)];
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 80, 24, 100);
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 80, 24, 100, &UNICODE_GLYPHS);
         let g = &f.geom;
         let left = g.x0 - 1;
         let right = 80 - (g.x0 + g.dw - 1);
@@ -1088,7 +1285,7 @@ mod tests {
     fn the_field_is_painted_and_the_current_entry_is_highlighted() {
         let all = vec![s("alpha", 30, "", true), s("beta", 20, "", true)];
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 60, 20, 100);
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 60, 20, 100, &UNICODE_GLYPHS);
         assert!(f.text.starts_with(FIELD), "the blue field must be painted first");
         assert!(f.text.contains(SEL), "the current entry needs the highlight");
         assert!(f.text.contains(WIN), "the dialog body needs its own colour");
@@ -1101,7 +1298,7 @@ mod tests {
     fn countdown_names_the_top_session_and_draws_a_bar() {
         let all = vec![s("older", 10, "", true), s("newest", 99, "", true)];
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, Some(0.5), 1.0, 80, 20, 100);
+        let f = render(&all, &idx, 0, 0, false, 0, Some(0.5), 1.0, 80, 20, 100, &UNICODE_GLYPHS);
         let p = strip_ansi(&f.text);
         assert!(p.contains("newest"), "{p}");
         assert!(p.contains('▓') && p.contains('░'), "{p}");
@@ -1111,7 +1308,7 @@ mod tests {
     fn a_card_claims_both_of_its_rows_across_the_dialog() {
         let all = vec![s("alpha", 30, "", true), s("beta", 20, "", true)];
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 60, 20, 100);
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 60, 20, 100, &UNICODE_GLYPHS);
         let rows0: Vec<usize> = f
             .hits
             .iter()
@@ -1132,7 +1329,7 @@ mod tests {
     fn the_buttons_share_a_row_and_do_not_overlap() {
         let all = vec![s("alpha", 30, "", true)];
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 2, None, 1.0, 60, 20, 100);
+        let f = render(&all, &idx, 0, 0, false, 2, None, 1.0, 60, 20, 100, &UNICODE_GLYPHS);
         let bar: Vec<&Hit> = f
             .hits
             .iter()
@@ -1154,7 +1351,7 @@ mod tests {
         let all = vec![s("alpha", 30, "", true)];
         let idx = view(&all, false);
         for cols in [20usize, 24, 28, 30, 36, 46, 60, 100] {
-            let f = render(&all, &idx, 0, 0, false, 7, None, 1.0, cols, 16, 100);
+            let f = render(&all, &idx, 0, 0, false, 7, None, 1.0, cols, 16, 100, &UNICODE_GLYPHS);
             let n = f
                 .hits
                 .iter()
@@ -1168,13 +1365,108 @@ mod tests {
     fn a_short_screen_falls_back_to_one_row_cards() {
         let all: Vec<Session> = (0..6).map(|i| s(&format!("s{i}"), i, "", true)).collect();
         let idx = view(&all, false);
-        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 40, 10, 100);
+        let f = render(&all, &idx, 0, 0, false, 0, None, 1.0, 40, 10, 100, &UNICODE_GLYPHS);
         let card_hits = f
             .hits
             .iter()
             .filter(|h| matches!(h.action, Action::Pick(_)))
             .count();
         assert_eq!(card_hits, f.per_page, "one row per visible card");
+    }
+
+    /// East Asian Width classes we must avoid: `A` is rendered two cells wide
+    /// by terminals with a CJK font, which is exactly how the frame tore.
+    fn is_ambiguous(c: char) -> bool {
+        let u = c as u32;
+        const A: &[(u32, u32)] = &[
+            (0x00a1, 0x00a1), (0x00a4, 0x00a4), (0x00a7, 0x00a8), (0x00aa, 0x00aa),
+            (0x00ad, 0x00ae), (0x00b0, 0x00b4), (0x00b6, 0x00ba), (0x00bc, 0x00bf),
+            (0x00c6, 0x00c6), (0x00d0, 0x00d0), (0x00d7, 0x00d8), (0x00de, 0x00e1),
+            (0x2010, 0x2010), (0x2013, 0x2016), (0x2018, 0x2019), (0x201c, 0x201d),
+            (0x2020, 0x2022), (0x2024, 0x2027), (0x2030, 0x2030), (0x2032, 0x2033),
+            (0x2035, 0x2035), (0x203b, 0x203b), (0x2074, 0x2074), (0x207f, 0x207f),
+            (0x2081, 0x2084), (0x20ac, 0x20ac), (0x2103, 0x2103), (0x2105, 0x2105),
+            (0x2109, 0x2109), (0x2113, 0x2113), (0x2116, 0x2116), (0x2121, 0x2122),
+            (0x2126, 0x2126), (0x212b, 0x212b), (0x2153, 0x2154), (0x215b, 0x215e),
+            (0x2160, 0x216b), (0x2170, 0x2179), (0x2189, 0x2189), (0x2190, 0x2199),
+            (0x21b8, 0x21b9), (0x21d2, 0x21d2), (0x21d4, 0x21d4), (0x21e7, 0x21e7),
+            (0x2200, 0x22bf), (0x2312, 0x2312), (0x2460, 0x24ea), (0x2500, 0x254b),
+            (0x2550, 0x2573), (0x2580, 0x258f), (0x2592, 0x2595), (0x25a0, 0x25a1),
+            (0x25a3, 0x25a9), (0x25b2, 0x25b3), (0x25b6, 0x25b7), (0x25bc, 0x25bd),
+            (0x25c0, 0x25c1), (0x25c6, 0x25c8), (0x25cb, 0x25cb), (0x25ce, 0x25d1),
+            (0x25e2, 0x25e5), (0x25ef, 0x25ef), (0x2605, 0x2606), (0x2609, 0x2609),
+            (0x260e, 0x260f), (0x2614, 0x2615), (0x261c, 0x261c), (0x261e, 0x261e),
+            (0x2640, 0x2640), (0x2642, 0x2642), (0x2660, 0x2661), (0x2663, 0x2665),
+            (0x2667, 0x266a), (0x266c, 0x266d), (0x266f, 0x266f), (0x273d, 0x273d),
+            (0x2776, 0x277f), (0xfffd, 0xfffd),
+        ];
+        A.iter().any(|(lo, hi)| u >= *lo && u <= *hi)
+    }
+
+    #[test]
+    fn the_ascii_glyph_set_has_nothing_a_cjk_terminal_will_widen() {
+        let g = ASCII_GLYPHS;
+        let mut text = String::new();
+        for c in [g.tl, g.tr, g.bl, g.br, g.h, g.v, g.tee_l, g.tee_r, g.bar_full, g.bar_empty, g.ellipsis] {
+            text.push(c);
+        }
+        for part in [g.sep, g.arrow, g.attached, g.hint_wide, g.hint_narrow] {
+            text.push_str(part);
+        }
+        let bad: Vec<char> = text.chars().filter(|c| is_ambiguous(*c)).collect();
+        assert!(bad.is_empty(), "ASCII set still contains ambiguous glyphs: {bad:?}");
+    }
+
+    #[test]
+    fn the_unicode_set_is_the_one_that_needs_a_narrow_terminal() {
+        // Not a defect, a precondition: this is why we measure before drawing.
+        let g = UNICODE_GLYPHS;
+        assert!(is_ambiguous(g.v) && is_ambiguous(g.h));
+    }
+
+    #[test]
+    fn the_frame_lines_up_under_both_glyph_sets() {
+        let all = vec![s("一个中文会话名", 30, "", true), s("agent", 20, "", true)];
+        let idx = view(&all, false);
+        for g in [&UNICODE_GLYPHS, &ASCII_GLYPHS] {
+            for cols in [24usize, 30, 40, 60, 80] {
+                let f = render(&all, &idx, 0, 0, false, 1, Some(0.5), 1.0, cols, 20, 100, g);
+                assert!(f.geom.x0 + f.geom.dw - 1 <= cols, "cols={cols} overflow");
+                // every drawn segment must fit the dialog it is drawn into
+                for h in &f.hits {
+                    assert!(h.col_end <= f.geom.x0 + f.geom.dw - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_ascii_render_contains_no_ambiguous_glyph_at_all() {
+        // The title carried a stray `·` through two rewrites; only rendering
+        // the whole frame and scanning it catches that class of leftover.
+        let all = vec![s("一个中文会话名", 30, "", true), s("agent", 20, "", true)];
+        for show_all in [false, true] {
+            let idx = view(&all, show_all);
+            for countdown in [None, Some(0.4)] {
+                for cols in [24usize, 40, 80] {
+                    let f =
+                        render(&all, &idx, 0, 0, show_all, 2, countdown, 1.0, cols, 20, 100,
+                               &ASCII_GLYPHS);
+                    let bad: Vec<char> =
+                        strip_ansi(&f.text).chars().filter(|c| is_ambiguous(*c)).collect();
+                    assert!(bad.is_empty(), "cols={cols} leftover ambiguous glyphs: {bad:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_report_tells_us_the_width() {
+        assert_eq!(width_from_dsr(b"\x1b[1;2R"), Some(1)); // narrow terminal
+        assert_eq!(width_from_dsr(b"\x1b[1;3R"), Some(2)); // CJK-wide terminal
+        assert_eq!(width_from_dsr(b"\x1b[1;9R"), None); // nonsense, do not trust
+        assert_eq!(width_from_dsr(b"\x1b[1;2"), None); // still arriving
+        assert_eq!(width_from_dsr(b""), None);
     }
 
     fn strip_ansi(s: &str) -> String {

@@ -46,6 +46,28 @@ two full-width rows, so a thumb does not have to be precise; taps are
 hit-tested against the cards and against each button's own columns. Mouse
 reporting is SGR (`1000h`/`1006h`), which phone SSH clients send on tap.
 
+## Character width
+
+Box drawing, arrows, middle dots and shade blocks are all East Asian
+*Ambiguous*. A terminal with a CJK font renders them two cells wide; a plain
+one renders them one. Counting wrong tears the frame apart, and on a phone that
+is exactly what happened: `│` and `─` doubled while the arithmetic still said
+one, so the right border landed in a different column on every row. The
+progress bar was worse -- `▓` is Ambiguous and `░` is Neutral, so the two
+halves of one bar disagreed.
+
+Rather than guess, the picker asks. Before drawing it prints one ambiguous
+character at a known column, reads the cursor back with `ESC[6n`, and picks a
+glyph set from the answer: the Unicode frame when the terminal says one cell,
+an all-ASCII frame (`+`, `-`, `|`, `#`, `.`, `->`, `*`) when it says two or
+will not answer. Nothing that survives into ASCII mode can be widened by a font.
+
+The answer is cached per `TERM` under
+`~/.cache/tmux-ssh-picker/ambiguous-width-<TERM>`, so only the first login on a
+new terminal pays the round trip. Delete that file to re-measure.
+`TMUX_SSH_MENU_AMBIGUOUS=1|2` forces the answer and skips the probe;
+`TMUX_SSH_MENU_PROBE_MS` changes the 600 ms patience.
+
 ## Keys
 
     ⏎        attach to the highlighted session
@@ -73,7 +95,7 @@ picker degrades the login; it cannot block it.
 ## Build
 
     ./build.sh              # installs to ~/.local/bin/tmux-ssh-picker
-    cargo test              # 20 unit tests
+    cargo test              # 25 unit tests
 
 No dependencies, deliberately: this runs on every SSH login. The few libc calls
 are declared in `src/main.rs`, so a bare `rustc src/main.rs` also works.

@@ -1018,16 +1018,34 @@ fn main() {
         let _ = w.write_all(frame.text.as_bytes());
         let _ = w.flush();
 
-        let wait_ms = if counting {
-            (remain * 1000.0).max(0.0) as i32
-        } else {
-            -1
-        };
-        if !wait_readable(fd, wait_ms) {
-            if counting {
+        // Wait in slices and re-read the window size between them.  A phone
+        // client sends its real size a moment after the shell starts, and the
+        // keyboard changes it again; a frame drawn at the old size is the
+        // torn dialog with its right border off screen.  SIGWINCH would do
+        // this too, but its default disposition is Ignore, so poll never sees
+        // EINTR unless a handler is installed -- polling is simpler and the
+        // 100 ms granularity is invisible.
+        const SLICE_MS: i32 = 100;
+        let mut got_input = false;
+        loop {
+            let left = if counting {
+                deadline.saturating_duration_since(Instant::now()).as_millis() as i32
+            } else {
+                i32::MAX
+            };
+            if counting && left <= 0 {
                 let s = &sessions[idx[0]];
                 finish!("ATTACH\t{}\t{}", s.socket, s.name);
             }
+            if wait_readable(fd, left.min(SLICE_MS)) {
+                got_input = true;
+                break;
+            }
+            if term_size(fd) != (cols, rows) {
+                break; // redraw at the new size
+            }
+        }
+        if !got_input {
             continue;
         }
         let n = match r.read(&mut chunk) {

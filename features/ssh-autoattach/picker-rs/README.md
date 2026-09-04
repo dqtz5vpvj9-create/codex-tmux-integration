@@ -92,6 +92,37 @@ terminal, no sessions — and the caller falls back to its own menu. So does any
 other exit, and so does a decision line the caller will not parse. A broken
 picker degrades the login; it cannot block it.
 
+## Window size
+
+The size is re-read between waits rather than once at startup. A phone client
+sends its real size a moment after the shell starts, and the keyboard changes
+it again; a frame drawn at the old size is the torn dialog with its right
+border off screen, which is what the first version did. SIGWINCH would serve,
+but its default disposition is Ignore, so `poll` never sees `EINTR` unless a
+handler is installed -- polling in 100 ms slices is simpler and the granularity
+is invisible.
+
+## Tests
+
+`tests/vt.py` is a terminal emulator: a real screen with per-cell colour, wide
+glyphs occupying two cells, xterm's deferred-wrap rule, the alternate buffer,
+DSR replies and a configurable East Asian Ambiguous width. The picker's bugs
+are all geometric -- a border in the wrong column, a stale frame after a
+resize, a cell painted the wrong colour -- and none of them are visible in a
+byte stream.
+
+`tests/test_vt.py` tests the emulator itself against behaviour xterm is
+specified to have. An untested tool proves nothing about what it measures, and
+an earlier ad-hoc version of these tests did pass a torn frame as clean.
+
+`tests/test_picker.py` drives the real binary on a pty and asserts on the
+screen: borders closing on one column at every size under both width
+regimes, redraws after a resize, the newt palette landing on the right cells,
+the glyph set following the terminal's answer, and taps addressed by screen
+column hitting the card or button drawn there.
+
+    tests/run-tests.sh      # units, emulator self-tests, rendered screens
+
 ## Build
 
     ./build.sh              # installs to ~/.local/bin/tmux-ssh-picker

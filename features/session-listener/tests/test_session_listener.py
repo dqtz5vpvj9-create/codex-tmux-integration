@@ -724,3 +724,53 @@ def test_controller_waits_through_app_server_restart(
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
     assert cli.main(["--no-state-file", "--no-title-sync"]) == 0
     assert outcomes == []
+
+
+def test_ephemeral_side_thread_does_not_replace_pane_thread() -> None:
+    state = listener.ProtocolState(connection())
+    state.consume(
+        "client_to_server",
+        {"method": "turn/start", "id": 1, "params": {"threadId": "thread-main"}},
+    )
+    sanitized, latest = listener.sanitize_protocol_message(
+        {
+            "id": 2,
+            "result": {
+                "thread": {"id": "thread-title", "ephemeral": True, "preview": "x"}
+            },
+        },
+        last_thread_id="thread-main",
+    )
+    assert latest == "thread-main"
+    assert sanitized == {
+        "id": 2,
+        "result": {"thread": {"id": "thread-title", "ephemeral": True}},
+    }
+    state.consume(
+        "client_to_server",
+        {"method": "thread/start", "id": 2, "params": {"cwd": "/tmp"}},
+    )
+    assert state.consume("server_to_client", sanitized) == []
+    events = state.consume(
+        "client_to_server",
+        {"method": "turn/start", "id": 3, "params": {"threadId": "thread-title"}},
+    )
+    assert events == []
+    assert state.thread_id == "thread-main"
+
+
+def test_switching_threads_drops_the_previous_name() -> None:
+    state = listener.ProtocolState(connection())
+    state.consume(
+        "client_to_server",
+        {"method": "thread/start", "id": 1, "params": {"cwd": "/tmp"}},
+    )
+    state.consume(
+        "server_to_client",
+        {"id": 1, "result": {"thread": {"id": "thread-one", "name": "first"}}},
+    )
+    events = state.consume(
+        "client_to_server",
+        {"method": "thread/resume", "id": 2, "params": {"threadId": "thread-two"}},
+    )
+    assert events[0]["thread"] == {"id": "thread-two", "name": None}

@@ -385,6 +385,13 @@ def sanitize_protocol_message(
             }
             if result_name is not None:
                 sanitized["result"]["thread"]["name"] = result_name
+            result_object = result.get("thread")
+            if isinstance(result_object, dict) and result_object.get("ephemeral") is True:
+                # The TUI runs helper work such as title generation on an
+                # ephemeral thread over the same connection. It must not
+                # replace the thread that the pane is showing.
+                sanitized["result"]["thread"]["ephemeral"] = True
+                return sanitized, last_thread_id
             return sanitized, result_thread
         if "error" in message:
             return {"id": message["id"], "error": {}}, last_thread_id
@@ -437,6 +444,7 @@ class ProtocolState:
     )
     thread_id: str | None = None
     thread_name: str | None = None
+    ephemeral_threads: set[str] = dataclasses.field(default_factory=set)
 
     def consume(self, direction: str, message: dict[str, Any]) -> list[dict[str, Any]]:
         return (
@@ -511,6 +519,10 @@ class ProtocolState:
         ) or pending_thread
         name = nested_string(result, ("thread", "name"), ("name",)) or pending_name
         if pending_method in {"thread/start", "thread/resume", "thread/fork"} and thread_id:
+            thread = result.get("thread") if isinstance(result, dict) else None
+            if isinstance(thread, dict) and thread.get("ephemeral") is True:
+                self.ephemeral_threads.add(thread_id)
+                return []
             return self._bind(thread_id, name, f"{pending_method}:response")
         if pending_method == "thread/name/set" and pending_thread == self.thread_id:
             # A successful response confirms that app-server processed the rename,
@@ -536,10 +548,12 @@ class ProtocolState:
         return []
 
     def _bind(self, thread_id: str, name: str | None, reason: str) -> list[dict[str, Any]]:
+        if thread_id in self.ephemeral_threads:
+            return []
         changed = thread_id != self.thread_id
         name_changed = name is not None and name != self.thread_name
         self.thread_id = thread_id
-        if name is not None:
+        if name is not None or changed:
             self.thread_name = name
         if not changed and not name_changed:
             return []

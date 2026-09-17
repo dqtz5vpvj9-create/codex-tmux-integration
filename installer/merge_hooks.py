@@ -21,6 +21,46 @@ MANAGED_EXECUTABLES = {
     "codex-tmux-notify-wrapper",
     "codex-tmux-title-sync",
 }
+AGENT_CONFIG_LOCATIONS = {
+    "codex": ("CODEX_HOME", ".codex", "hooks.json"),
+    "claude": ("CLAUDE_CONFIG_DIR", ".claude", "settings.json"),
+}
+
+
+def agent_config_path(home: Path, agent: str) -> Path:
+    """Return where one agent keeps the hook configuration this project merges.
+
+    ``CODEX_HOME`` and ``CLAUDE_CONFIG_DIR`` are honored only when the caller
+    targets the real home directory, so an explicit ``--home`` used by tests or
+    by an isolated install can never escape into live configuration.
+    """
+
+    variable, directory, filename = AGENT_CONFIG_LOCATIONS[agent]
+    home = home.expanduser().resolve()
+    configured = os.environ.get(variable, "").strip()
+    if configured and home == Path.home().expanduser().resolve():
+        return Path(configured).expanduser() / filename
+    return home / directory / filename
+
+
+def managed_hook_features(document: dict[str, Any]) -> set[str]:
+    """Return the feature markers present in one agent configuration."""
+
+    features: set[str] = set()
+    events = document.get("hooks")
+    if not isinstance(events, dict):
+        return features
+    for groups in events.values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            hooks = group.get("hooks") if isinstance(group, dict) else None
+            for hook in hooks if isinstance(hooks, list) else []:
+                command = hook.get("command") if isinstance(hook, dict) else ""
+                for word in command_words(command):
+                    if word.startswith(OWNERSHIP_PREFIX):
+                        features.add(word[len(OWNERSHIP_PREFIX) :])
+    return features
 
 
 def load_json(path: Path) -> dict[str, Any]:

@@ -8,7 +8,13 @@ import importlib.machinery
 import importlib.util
 from pathlib import Path
 
-from merge_hooks import apply_fragments, atomic_write_json, hooks_diff, load_json
+from merge_hooks import (
+    agent_config_path,
+    apply_fragments,
+    atomic_write_json,
+    hooks_diff,
+    load_json,
+)
 
 
 def load_install_module():
@@ -63,8 +69,8 @@ def main() -> int:
     shell_aggregate = config_root / "shell.zsh"
     tmux_main = home / ".tmux.conf"
     zsh_main = home / ".zshrc"
-    codex_hooks = home / ".codex" / "hooks.json"
-    claude_settings = home / ".claude" / "settings.json"
+    codex_hooks = agent_config_path(home, "codex")
+    claude_settings = agent_config_path(home, "claude")
 
     installed_links = {
         Path(target): Path(source) for target, source in state.get("links", {}).items()

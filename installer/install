@@ -19,19 +19,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from merge_hooks import apply_fragments, atomic_write_json, hooks_diff, load_json
+from merge_hooks import (
+    agent_config_path,
+    apply_fragments,
+    atomic_write_json,
+    hooks_diff,
+    load_json,
+)
 
 MANAGED_BEGIN = "# >>> codex-tmux-integration >>>"
 MANAGED_END = "# <<< codex-tmux-integration <<<"
 STATE_SCHEMA = 2
 ALL_FEATURES = (
     "title-sync",
+    "session-listener",
     "window-attention",
     "pane-logging",
+    "model-switch",
     "ssh-autoattach",
     "external-notifications",
 )
-TMUX_FEATURES = {"title-sync", "window-attention", "pane-logging"}
+TMUX_FEATURES = {"title-sync", "window-attention", "pane-logging", "model-switch"}
 LEGACY_HOOKS = {
     "title-sync": {
         "pane-focus-in[50]": "codex-tmux-title-sync",
@@ -435,8 +443,8 @@ def main() -> int:
     shell_aggregate = config_root / "shell.zsh"
     tmux_main = home / ".tmux.conf"
     zsh_main = home / ".zshrc"
-    codex_hooks = home / ".codex" / "hooks.json"
-    claude_settings = home / ".claude" / "settings.json"
+    codex_hooks = agent_config_path(home, "codex")
+    claude_settings = agent_config_path(home, "claude")
     notification_config = config_root / "notifications.env"
 
     tmux_text, shell_text = desired_aggregators(manifests)

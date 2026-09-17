@@ -118,3 +118,58 @@ def test_empty_matcher_group_is_removed_with_owned_hook():
         }
     }
     assert merge.remove_managed_hooks(original, REPLACEMENTS)["hooks"] == {}
+
+
+def test_agent_config_paths_default_to_the_target_home(tmp_path):
+    assert merge.agent_config_path(tmp_path, "codex") == tmp_path / ".codex/hooks.json"
+    assert (
+        merge.agent_config_path(tmp_path, "claude")
+        == tmp_path / ".claude/settings.json"
+    )
+
+
+def test_agent_home_variables_apply_only_to_the_real_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    real_home = Path.home()
+
+    assert (
+        merge.agent_config_path(real_home, "claude")
+        == tmp_path / "claude/settings.json"
+    )
+    assert merge.agent_config_path(real_home, "codex") == tmp_path / "codex/hooks.json"
+    # An explicit --home for a test or an isolated install must stay contained.
+    assert (
+        merge.agent_config_path(tmp_path, "claude")
+        == tmp_path / ".claude/settings.json"
+    )
+
+
+def test_managed_hook_features_lists_only_marker_owned_commands():
+    document = {
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "env CODEX_TMUX_INTEGRATION=title-sync /tmp/bin/codex-tmux-title-sync",
+                        },
+                        {"type": "command", "command": "/opt/user/quota.sh"},
+                    ]
+                }
+            ],
+            "Notification": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "env CODEX_TMUX_INTEGRATION=window-attention /tmp/bin/agent-tmux-notify",
+                        }
+                    ]
+                }
+            ],
+        }
+    }
+    assert merge.managed_hook_features(document) == {"title-sync", "window-attention"}
+    assert merge.managed_hook_features({}) == set()

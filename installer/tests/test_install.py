@@ -79,6 +79,11 @@ def test_install_is_idempotent_and_preserves_unrelated_data(tmp_path):
     assert "# >>> codex-tmux-integration >>>" in tmux_main
     assert "set -g automatic-rename off" in tmux_main
     assert "/opt/user/codex-tmux-title-sync" in tmux_main
+    shell_aggregate = (
+        tmp_path / ".config/codex-tmux-integration/shell.zsh"
+    ).read_text()
+    assert "features/title-sync/shell/codex-title.zsh" in shell_aggregate
+    assert "features/ssh-autoattach/shell/tmux-ssh.zsh" in shell_aggregate
     codex = json.loads((tmp_path / ".codex/hooks.json").read_text())
     claude = json.loads((tmp_path / ".claude/settings.json").read_text())
     assert claude["env"]["SETTING"] == "keep"
@@ -87,7 +92,13 @@ def test_install_is_idempotent_and_preserves_unrelated_data(tmp_path):
         for group in codex["hooks"]["Stop"]
         for hook in group["hooks"]
     )
-    assert "SessionEnd" in codex["hooks"]
+    assert "SessionEnd" in claude["hooks"]
+    assert all(
+        "codex-tmux-title-sync" not in hook["command"]
+        for groups in codex["hooks"].values()
+        for group in groups
+        for hook in group["hooks"]
+    )
     assert all(
         "CODEX_TMUX_INTEGRATION=" in hook["command"]
         for groups in codex["hooks"].values()
@@ -230,6 +241,45 @@ def test_non_tmux_feature_does_not_add_empty_tmux_or_shell_blocks(tmp_path):
     assert installed.returncode == 0, installed.stderr
     assert "# >>> codex-tmux-integration >>>" not in (tmp_path / ".tmux.conf").read_text()
     assert "# >>> codex-tmux-integration >>>" not in (tmp_path / ".zshrc").read_text()
+
+
+def test_session_listener_installs_only_explicit_setup_commands(tmp_path):
+    prepare_home(tmp_path)
+    installed = run(
+        INSTALL,
+        "--home",
+        tmp_path,
+        "--repo-root",
+        REPO_ROOT,
+        "--features",
+        "session-listener",
+    )
+    assert installed.returncode == 0, installed.stderr
+    for command in (
+        "codex-session-listener",
+        "codex-session-diagnose",
+        "install-codex-session-listener-helper",
+        "install-codex-session-listener-service",
+    ):
+        assert (tmp_path / ".local/bin" / command).is_symlink()
+    assert "# >>> codex-tmux-integration >>>" not in (tmp_path / ".tmux.conf").read_text()
+    assert "# >>> codex-tmux-integration >>>" not in (tmp_path / ".zshrc").read_text()
+    state = json.loads(
+        (tmp_path / ".local/state/codex-tmux-integration/state.json").read_text()
+    )
+    assert state["enabled_features"] == ["session-listener"]
+
+    service = run(
+        tmp_path / ".local/bin/install-codex-session-listener-service",
+        "--home",
+        tmp_path,
+        "--no-start",
+        "--no-reload",
+    )
+    assert service.returncode == 0, service.stderr
+    unit = tmp_path / ".config/systemd/user/codex-session-listener.service"
+    assert unit.is_file()
+    assert "ExecStart=%h/.local/bin/codex-session-listener" in unit.read_text()
 
 
 def test_notification_backend_is_stored_in_private_local_config(tmp_path):

@@ -16,7 +16,11 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from merge_hooks import command_executable  # noqa: E402
+from merge_hooks import (  # noqa: E402
+    agent_config_path,
+    command_executable,
+    managed_hook_features,
+)
 
 STATE_SCHEMA = 2
 MANAGED_EXECUTABLES = {
@@ -26,9 +30,9 @@ MANAGED_EXECUTABLES = {
     "codex-tmux-title-sync",
 }
 TMUX_HOOK_COUNTS = {
-    "title-sync": 4,
+    "title-sync": 6,
     "window-attention": 4,
-    "pane-logging": 3,
+    "pane-logging": 5,
 }
 
 
@@ -103,9 +107,17 @@ def main() -> int:
     result("repository", repo_root.is_dir(), str(repo_root))
     errors += not repo_root.is_dir()
 
+    manifests = {}
     for feature in enabled:
         manifest = repo_root / "features" / feature / "feature.json"
-        ok = manifest.is_file()
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            ok = isinstance(data, dict) and data.get("name") == feature
+        except (OSError, json.JSONDecodeError, TypeError):
+            data = {}
+            ok = False
+        if ok:
+            manifests[feature] = data
         result(f"feature {feature}", ok, str(manifest))
         errors += not ok
 
@@ -127,7 +139,7 @@ def main() -> int:
         errors += not ok
 
     tmux_features = [feature for feature in enabled if feature in TMUX_HOOK_COUNTS]
-    shell_enabled = "ssh-autoattach" in enabled
+    shell_enabled = any(manifests.get(feature, {}).get("shell") for feature in enabled)
     tmux_main = home / ".tmux.conf"
     zsh_main = home / ".zshrc"
     for label, path, expected in (
@@ -142,10 +154,14 @@ def main() -> int:
         result(label, ok, str(path))
         errors += not ok
 
-    for label, path in (
-        ("Codex hooks JSON", home / ".codex/hooks.json"),
-        ("Claude settings JSON", home / ".claude/settings.json"),
-    ):
+    for agent, label in (("codex", "Codex hooks JSON"), ("claude", "Claude settings JSON")):
+        path = agent_config_path(home, agent)
+        expected = {
+            feature
+            for feature in enabled
+            if manifests.get(feature, {}).get("hooks", {}).get(agent)
+        }
+        present: set[str] = set()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             hooks = data.get("hooks", {})
@@ -160,10 +176,20 @@ def main() -> int:
                             executable = command_executable(command)
                             if Path(executable).name in MANAGED_EXECUTABLES:
                                 ok = ok and Path(executable).is_file()
+                present = managed_hook_features(data)
         except (OSError, json.JSONDecodeError, TypeError):
             ok = False
         result(label, ok, str(path))
         errors += not ok
+
+        missing = sorted(expected - present)
+        detail = (
+            f"missing {', '.join(missing)}"
+            if missing
+            else ", ".join(sorted(expected)) or "none required"
+        )
+        result(f"{agent} lifecycle hooks", not missing, detail)
+        errors += bool(missing)
 
     if shell_enabled:
         zsh = shutil.which("zsh")
@@ -238,6 +264,8 @@ def main() -> int:
             warning("optional notification backend", "no local backend configured")
             warnings += 1
 
+    for agent in ("codex", "claude"):
+        print(f"INFO {agent} CLI - {shutil.which(agent) or 'not found'}")
     print(f"INFO live tmux servers - {len(live)}")
     print(f"SUMMARY errors={errors} warnings={warnings}")
     return 1 if errors else 0

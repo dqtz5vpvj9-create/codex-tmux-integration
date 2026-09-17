@@ -20,6 +20,28 @@ migration on registered live tmux servers:
 A user hook at the same historical index remains in place when its command does
 not match the old feature command.
 
+## Adding Claude Code to an existing install
+
+No state migration is required. Re-run `installer/install` with the same feature
+selection: it merges the Claude fragments into `~/.claude/settings.json`
+alongside the existing Codex hooks, leaving unrelated settings and hooks in that
+file untouched. Existing Codex behavior is unchanged.
+
+A Claude session that was already running when the hooks were installed has no
+`SessionStart` left to fire. Its window is picked up by the next focus hook, or
+immediately by:
+
+```bash
+codex-tmux-title-sync --socket "$(tmux display-message -p '#{socket_path}')" --all
+```
+
+`installer/doctor` reports per agent whether every enabled feature's lifecycle
+hooks are present, so a partially migrated configuration is visible without
+reading the JSON by hand.
+
+Set `CLAUDE_CONFIG_DIR` before installing when Claude Code does not use
+`~/.claude`; it is honored the same way `CODEX_HOME` already is.
+
 ## Cutover
 
 1. Run `installer/install --dry-run`.

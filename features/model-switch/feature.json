@@ -1,0 +1,21 @@
+{
+  "name": "model-switch",
+  "description": "Switch the active Codex or Claude model from tmux.",
+  "dependencies": ["tmux-context"],
+  "binaries": [
+    {
+      "source": "bin/codex-tmux-model-switch",
+      "name": "codex-tmux-model-switch"
+    },
+    {
+      "source": "bin/codex-tmux-model-popup",
+      "name": "codex-tmux-model-popup"
+    }
+  ],
+  "tmux": ["tmux/model-switch.conf"],
+  "shell": [],
+  "hooks": {
+    "codex": [],
+    "claude": []
+  }
+}

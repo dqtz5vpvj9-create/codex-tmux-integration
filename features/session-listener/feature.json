@@ -1,0 +1,17 @@
+{
+  "name": "session-listener",
+  "description": "Observe Codex app-server session metadata without proxying or modifying Codex.",
+  "dependencies": [],
+  "binaries": [
+    {"source": "bin/codex-session-listener", "name": "codex-session-listener"},
+    {"source": "bin/codex-session-diagnose", "name": "codex-session-diagnose"},
+    {"source": "bin/install-codex-session-listener-helper", "name": "install-codex-session-listener-helper"},
+    {"source": "bin/install-codex-session-listener-service", "name": "install-codex-session-listener-service"}
+  ],
+  "tmux": [],
+  "shell": [],
+  "hooks": {
+    "codex": [],
+    "claude": []
+  }
+}

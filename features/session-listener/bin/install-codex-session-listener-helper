@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Install an immutable privileged capture bundle.
+
+The normal listener never asks root to execute code from the user-writable
+repository.  This explicit installation step builds the BPF object as the
+calling user, then copies a content-addressed Python/helper bundle as root.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+FEATURE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(FEATURE_ROOT))
+
+from session_listener.capture import build_bpf_object  # noqa: E402
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--prefix",
+        type=Path,
+        default=Path("/usr/libexec/codex-session-listener"),
+    )
+    parser.add_argument(
+        "--control-socket",
+        type=Path,
+        default=Path.home() / ".codex/app-server-control/app-server-control.sock",
+    )
+    parser.add_argument("--no-sudoers", action="store_true")
+    return parser.parse_args()
+
+
+def root_command(arguments: list[str]) -> list[str]:
+    return arguments if os.geteuid() == 0 else ["/usr/bin/sudo", "--", *arguments]
+
+
+def run_root(arguments: list[str]) -> None:
+    completed = subprocess.run(root_command(arguments), check=False)
+    if completed.returncode != 0:
+        raise SystemExit(completed.returncode)
+
+
+def sudoers_argument(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_./%+@-]+", value):
+        raise SystemExit(f"unsafe path or argument for exact sudoers rule: {value!r}")
+    return value
+
+
+def main() -> int:
+    args = parse_args()
+    temporary, object_path = build_bpf_object()
+    sources = {
+        "codex_session_listener.py": FEATURE_ROOT / "codex_session_listener.py",
+        "session_listener/__init__.py": FEATURE_ROOT / "session_listener/__init__.py",
+        "session_listener/model.py": FEATURE_ROOT / "session_listener/model.py",
+        "session_listener/protocol.py": FEATURE_ROOT / "session_listener/protocol.py",
+        "session_listener/capture.py": FEATURE_ROOT / "session_listener/capture.py",
+        "session_listener/cli.py": FEATURE_ROOT / "session_listener/cli.py",
+        "bpf/codex_session_capture.bpf.c": (
+            FEATURE_ROOT / "bpf/codex_session_capture.bpf.c"
+        ),
+        "bpf/codex_session_capture.bpf.o": object_path,
+    }
+    digest = hashlib.sha256()
+    for relative, source in sorted(sources.items()):
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(source.read_bytes())
+    version = digest.hexdigest()[:20]
+    prefix = args.prefix.resolve(strict=False)
+    destination = prefix / "versions" / version
+    try:
+        for directory in (
+            prefix,
+            prefix / "versions",
+            destination,
+            destination / "session_listener",
+            destination / "bpf",
+        ):
+            run_root(
+                [
+                    "/usr/bin/install",
+                    "-d",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0755",
+                    str(directory),
+                ]
+            )
+        for relative, source in sources.items():
+            run_root(
+                [
+                    "/usr/bin/install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0644",
+                    str(source),
+                    str(destination / relative),
+                ]
+            )
+        temporary_link = prefix / f".current-{os.getuid()}-{os.getpid()}"
+        run_root(
+            [
+                "/usr/bin/ln",
+                "-sfn",
+                str(Path("versions") / version),
+                str(temporary_link),
+            ]
+        )
+        run_root(
+            [
+                "/usr/bin/mv",
+                "-Tf",
+                str(temporary_link),
+                str(prefix / "current"),
+            ]
+        )
+        if not args.no_sudoers:
+            account = pwd.getpwuid(os.getuid()).pw_name
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", account):
+                raise SystemExit(f"unsupported account name for sudoers: {account!r}")
+            helper = prefix / "current/codex_session_listener.py"
+            command = " ".join(
+                sudoers_argument(str(item))
+                for item in (
+                    "/usr/bin/python3",
+                    "-I",
+                    "-E",
+                    "-s",
+                    helper,
+                    "--capture-helper",
+                    "--control-socket",
+                    args.control_socket.resolve(strict=False),
+                )
+            )
+            rule = f"{account} ALL=(root) NOPASSWD: {command}\n"
+            descriptor, rule_path = tempfile.mkstemp(
+                prefix="codex-session-listener-sudoers-"
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    stream.write(rule)
+                run_root(["/usr/sbin/visudo", "-cf", rule_path])
+                run_root(
+                    [
+                        "/usr/bin/install",
+                        "-o",
+                        "root",
+                        "-g",
+                        "root",
+                        "-m",
+                        "0440",
+                        rule_path,
+                        f"/etc/sudoers.d/codex-session-listener-{os.getuid()}",
+                    ]
+                )
+            finally:
+                try:
+                    os.unlink(rule_path)
+                except FileNotFoundError:
+                    pass
+    finally:
+        temporary.cleanup()
+    print(f"installed trusted helper: {destination}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

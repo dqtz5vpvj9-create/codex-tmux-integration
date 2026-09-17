@@ -1,0 +1,12 @@
+[Unit]
+Description=Codex app-server session registry
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codex-session-listener
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=default.target

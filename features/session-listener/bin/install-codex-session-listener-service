@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Install the listener as an explicit per-user systemd service."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+
+FEATURE_ROOT = Path(__file__).resolve().parents[1]
+UNIT_NAME = "codex-session-listener.service"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-start", action="store_true")
+    parser.add_argument("--no-reload", action="store_true")
+    parser.add_argument("--home", type=Path, default=Path.home())
+    args = parser.parse_args()
+    source = FEATURE_ROOT / "systemd" / UNIT_NAME
+    destination = args.home / ".config/systemd/user" / UNIT_NAME
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{UNIT_NAME}.{os.getpid()}")
+    try:
+        shutil.copyfile(source, temporary)
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    commands = (
+        []
+        if args.no_reload
+        else [["/usr/bin/systemctl", "--user", "daemon-reload"]]
+    )
+    if not args.no_start:
+        commands.append(
+            ["/usr/bin/systemctl", "--user", "enable", "--now", UNIT_NAME]
+        )
+    for command in commands:
+        completed = subprocess.run(command, check=False)
+        if completed.returncode != 0:
+            return completed.returncode
+    print(f"installed user service: {destination}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

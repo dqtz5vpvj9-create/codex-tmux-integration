@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Entry point for the Codex app-server session listener."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+FEATURE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(FEATURE_ROOT))
+
+from session_listener.cli import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

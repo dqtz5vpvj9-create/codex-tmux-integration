@@ -77,6 +77,26 @@ FEATURE_HOOKS: dict[str, tuple[tuple[str, str], ...]] = {
             ),
         ),
         (
+            "window-linked",
+            _run_shell(
+                "title-sync",
+                "codex-tmux-title-sync",
+                "--socket",
+                "#{q:socket_path}",
+                "--all",
+            ),
+        ),
+        (
+            "window-unlinked",
+            _run_shell(
+                "title-sync",
+                "codex-tmux-title-sync",
+                "--socket",
+                "#{q:socket_path}",
+                "--all",
+            ),
+        ),
+        (
             "pane-exited",
             _run_shell(
                 "title-sync",
@@ -85,8 +105,6 @@ FEATURE_HOOKS: dict[str, tuple[tuple[str, str], ...]] = {
                 "#{q:socket_path}",
                 "--pane",
                 "#{hook_pane}",
-                "--window",
-                "#{hook_window}",
                 "--pane-exited",
             ),
         ),
@@ -178,6 +196,26 @@ FEATURE_HOOKS: dict[str, tuple[tuple[str, str], ...]] = {
                 "#{pane_id}",
             ),
         ),
+        (
+            "pane-exited",
+            _run_shell(
+                "pane-logging",
+                "tmux-autolog",
+                "--socket",
+                "#{q:socket_path}",
+                "prune",
+            ),
+        ),
+        (
+            "session-closed",
+            _run_shell(
+                "pane-logging",
+                "tmux-autolog",
+                "--socket",
+                "#{q:socket_path}",
+                "prune",
+            ),
+        ),
     ),
 }
 
@@ -222,20 +260,38 @@ def remove_feature(socket: str, feature: str) -> int:
     return removed
 
 
+def feature_is_complete(socket: str, feature: str) -> bool:
+    return all(
+        len(owned_hook_targets(socket, feature, hook_name)) == 1
+        for hook_name, _ in FEATURE_HOOKS[feature]
+    )
+
+
 def install_feature(socket: str, feature: str) -> int:
-    remove_feature(socket, feature)
     installed = 0
     for hook_name, command in FEATURE_HOOKS[feature]:
+        previous = owned_hook_targets(socket, feature, hook_name)
         result = tmux(socket, "set-hook", "-ag", hook_name, command)
-        if result is not None and result.returncode == 0:
-            installed += 1
+        if result is None or result.returncode != 0:
+            installed += int(bool(previous))
+            continue
+        installed += 1
+        for target in previous:
+            tmux(socket, "set-hook", "-gu", target)
     register_socket(socket, server_pid(socket))
     return installed
 
 
+def ensure_feature(socket: str, feature: str) -> int:
+    if feature_is_complete(socket, feature):
+        register_socket(socket, server_pid(socket))
+        return len(FEATURE_HOOKS[feature])
+    return install_feature(socket, feature)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("install", "remove", "list-owned"))
+    parser.add_argument("operation", choices=("install", "ensure", "remove", "list-owned"))
     parser.add_argument("feature", choices=tuple(FEATURE_HOOKS))
     parser.add_argument("--socket")
     return parser
@@ -247,7 +303,11 @@ def main() -> int:
     if not socket:
         return 0
     if args.operation == "install":
-        install_feature(socket, args.feature)
+        installed = install_feature(socket, args.feature)
+        return int(installed != len(FEATURE_HOOKS[args.feature]))
+    elif args.operation == "ensure":
+        installed = ensure_feature(socket, args.feature)
+        return int(installed != len(FEATURE_HOOKS[args.feature]))
     elif args.operation == "remove":
         remove_feature(socket, args.feature)
     else:

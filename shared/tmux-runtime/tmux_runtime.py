@@ -120,14 +120,17 @@ def default_socket_candidates() -> Iterable[str]:
 
 
 def discover_sockets(home: Path | None = None) -> list[str]:
-    sockets = set(default_socket_candidates())
-    sockets.update(registered_sockets(home))
-    current = socket_from_tmux_env()
-    if current:
-        sockets.add(current)
-    configured = os.environ.get("CODEX_TMUX_SOCKETS", "")
-    if configured:
-        sockets.update(value for value in configured.split(os.pathsep) if value)
+    sockets = set(registered_sockets(home))
+    actual_home = Path.home().expanduser().resolve()
+    requested_home = actual_home if home is None else home.expanduser().resolve()
+    if requested_home == actual_home:
+        sockets.update(default_socket_candidates())
+        current = socket_from_tmux_env()
+        if current:
+            sockets.add(current)
+        configured = os.environ.get("CODEX_TMUX_SOCKETS", "")
+        if configured:
+            sockets.update(value for value in configured.split(os.pathsep) if value)
     return sorted(sockets)
 
 

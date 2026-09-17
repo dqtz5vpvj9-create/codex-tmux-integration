@@ -25,12 +25,35 @@ def test_registry_preserves_custom_sockets(monkeypatch, tmp_path):
 
 
 def test_discovery_combines_default_registry_and_environment(monkeypatch, tmp_path):
-    path = runtime.registry_path(tmp_path)
-    path.parent.mkdir(parents=True)
-    path.write_text("/registered\t1\n", encoding="utf-8")
+    current_home = Path.home().resolve()
+    monkeypatch.setattr(
+        runtime, "registered_sockets", lambda home: ["/registered"]
+    )
     monkeypatch.setattr(runtime, "default_socket_candidates", lambda: ["/default"])
     monkeypatch.setenv("TMUX", "/current,1,0")
-    assert runtime.discover_sockets(tmp_path) == ["/current", "/default", "/registered"]
+    assert runtime.discover_sockets(current_home) == [
+        "/current",
+        "/default",
+        "/registered",
+    ]
+
+
+def test_explicit_other_home_does_not_discover_current_runtime(
+    monkeypatch, tmp_path
+):
+    path = runtime.registry_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("/registered-other\t1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        runtime,
+        "default_socket_candidates",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("must not inspect current user's socket directory")
+        ),
+    )
+    monkeypatch.setenv("TMUX", "/current,1,0")
+    monkeypatch.setenv("CODEX_TMUX_SOCKETS", "/configured")
+    assert runtime.discover_sockets(tmp_path) == ["/registered-other"]
 
 
 def test_hook_commands_are_marker_owned_and_have_no_fixed_index():
@@ -43,6 +66,13 @@ def test_attention_clear_hooks_are_synchronous():
     commands = [command for _, command in manager.FEATURE_HOOKS["window-attention"]]
     assert all(command.startswith("run-shell ") for command in commands)
     assert all(not command.startswith("run-shell -b ") for command in commands)
+
+
+def test_pane_exit_hook_does_not_require_optional_hook_window():
+    commands = dict(manager.FEATURE_HOOKS["title-sync"])
+    pane_exit = commands["pane-exited"]
+    assert "--pane #{hook_pane} --pane-exited" in pane_exit
+    assert "--window" not in pane_exit
 
 
 def test_owned_hook_targets_select_only_matching_marker(monkeypatch):
@@ -62,19 +92,68 @@ def test_owned_hook_targets_select_only_matching_marker(monkeypatch):
     ]
 
 
-def test_install_removes_owned_entries_then_appends(monkeypatch):
+def test_install_appends_replacements_before_removing_owned_entries(monkeypatch):
     calls = []
 
     class Result:
         returncode = 0
         stdout = ""
 
-    monkeypatch.setattr(manager, "remove_feature", lambda socket, feature: calls.append(("remove", feature)) or 2)
+    monkeypatch.setattr(
+        manager,
+        "owned_hook_targets",
+        lambda socket, feature, hook_name: [f"{hook_name}[9]"],
+    )
     monkeypatch.setattr(manager, "tmux", lambda socket, *args: calls.append(("tmux", *args)) or Result())
     monkeypatch.setattr(manager, "register_socket", lambda socket, pid: calls.append(("register", socket, pid)))
     monkeypatch.setattr(manager, "server_pid", lambda socket: 99)
     installed = manager.install_feature("/tmp/socket", "pane-logging")
-    assert installed == 3
-    assert calls[0] == ("remove", "pane-logging")
-    assert all(call[1:3] == ("set-hook", "-ag") for call in calls[1:4])
+    assert installed == len(manager.FEATURE_HOOKS["pane-logging"])
+    for hook_name, command in manager.FEATURE_HOOKS["pane-logging"]:
+        append = ("tmux", "set-hook", "-ag", hook_name, command)
+        remove = ("tmux", "set-hook", "-gu", f"{hook_name}[9]")
+        assert calls.index(append) < calls.index(remove)
     assert calls[-1] == ("register", "/tmp/socket", 99)
+
+
+def test_install_failure_preserves_previous_hook(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(
+        manager,
+        "FEATURE_HOOKS",
+        {"window-attention": (("after-select-window", "new-command"),)},
+    )
+    monkeypatch.setattr(
+        manager,
+        "owned_hook_targets",
+        lambda socket, feature, hook_name: ["after-select-window[4]"],
+    )
+    monkeypatch.setattr(manager, "tmux", lambda socket, *args: calls.append(args) or Result())
+    monkeypatch.setattr(manager, "register_socket", lambda *args: None)
+    monkeypatch.setattr(manager, "server_pid", lambda socket: 99)
+    assert manager.install_feature("/tmp/socket", "window-attention") == 1
+    assert ("set-hook", "-gu", "after-select-window[4]") not in calls
+
+
+def test_ensure_complete_feature_does_not_reinstall(monkeypatch):
+    registered = []
+    monkeypatch.setattr(manager, "feature_is_complete", lambda socket, feature: True)
+    monkeypatch.setattr(
+        manager,
+        "install_feature",
+        lambda *args: (_ for _ in ()).throw(AssertionError("unexpected reinstall")),
+    )
+    monkeypatch.setattr(manager, "server_pid", lambda socket: 99)
+    monkeypatch.setattr(
+        manager,
+        "register_socket",
+        lambda socket, pid: registered.append((socket, pid)),
+    )
+    expected = len(manager.FEATURE_HOOKS["window-attention"])
+    assert manager.ensure_feature("/tmp/socket", "window-attention") == expected
+    assert registered == [("/tmp/socket", 99)]

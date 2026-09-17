@@ -10,17 +10,36 @@ from pathlib import Path
 from typing import Any, Mapping
 
 TMUX_TIMEOUT_SECONDS = 0.8
+AGENT_CODEX = "codex"
+AGENT_CLAUDE = "claude"
+AGENT_KINDS = (AGENT_CODEX, AGENT_CLAUDE)
 EMPTY_TARGET: dict[str, Any] = {
     "socket": "",
     "pane": "",
     "server_pid": -1,
     "pane_pid": -1,
     "window_id": "",
+    "agent_kind": "",
     "agent_pid": -1,
     "agent_start_time": -1,
     "score": 0,
     "ambiguous": False,
 }
+
+# The ``claude`` executable also serves subcommands that never own a pane.
+CLAUDE_NON_SESSION_COMMANDS = frozenset(
+    {
+        "config",
+        "doctor",
+        "install",
+        "mcp",
+        "migrate-installer",
+        "plugin",
+        "setup-token",
+        "update",
+    }
+)
+CLAUDE_RESUME_FLAGS = ("--resume", "-r")
 
 
 def _clean(value: Any) -> str:
@@ -143,36 +162,73 @@ def process_is_alive(pid: int, start_time: int = -1) -> bool:
 
 
 def _is_codex_process(pid: int) -> bool:
-    if _proc_comm(pid) != "codex":
+    if _proc_comm(pid) != AGENT_CODEX:
         return False
     parts = _proc_cmdline(pid)
     return not any(part == "app-server" for part in parts[1:])
 
 
-def _ancestor_codex_pids(start_pid: int | None = None) -> list[int]:
+def _claude_subcommand(parts: list[str]) -> str:
+    """Return the first positional argument of a ``claude`` command line."""
+
+    index = 1
+    while index < len(parts):
+        value = parts[index]
+        if value == "--":
+            index += 1
+            break
+        if value.startswith("-"):
+            index += 1
+            continue
+        break
+    return parts[index] if index < len(parts) else ""
+
+
+def _is_claude_process(pid: int) -> bool:
+    if _proc_comm(pid) != AGENT_CLAUDE:
+        return False
+    return _claude_subcommand(_proc_cmdline(pid)) not in CLAUDE_NON_SESSION_COMMANDS
+
+
+def agent_kind_for_pid(pid: int) -> str:
+    """Return ``codex``, ``claude`` or an empty string for one process."""
+
+    if _is_codex_process(pid):
+        return AGENT_CODEX
+    if _is_claude_process(pid):
+        return AGENT_CLAUDE
+    return ""
+
+
+def _ancestor_agent_pids(start_pid: int | None = None) -> list[tuple[int, str]]:
     pid = os.getppid() if start_pid is None else start_pid
-    result: list[int] = []
+    result: list[tuple[int, str]] = []
     seen: set[int] = set()
     for _ in range(64):
         if pid <= 1 or pid in seen:
             break
         seen.add(pid)
-        if _is_codex_process(pid):
-            result.append(pid)
+        kind = agent_kind_for_pid(pid)
+        if kind:
+            result.append((pid, kind))
         ppid, _ = _proc_stat_fields(pid)
         pid = ppid
     return result
 
 
-def _codex_pids() -> list[int]:
+def _agent_pids() -> list[tuple[int, str]]:
     try:
         entries = list(Path("/proc").iterdir())
     except OSError:
         return []
-    result = []
+    result: list[tuple[int, str]] = []
     for entry in entries:
-        if entry.name.isdigit() and _is_codex_process(int(entry.name)):
-            result.append(int(entry.name))
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        kind = agent_kind_for_pid(pid)
+        if kind:
+            result.append((pid, kind))
     return sorted(result)
 
 
@@ -182,6 +238,14 @@ def _codex_home(process_env: Mapping[str, str]) -> Path:
         return Path(configured).expanduser()
     home = _clean(process_env.get("HOME"))
     return Path(home).expanduser() / ".codex" if home else Path.home() / ".codex"
+
+
+def _claude_home(process_env: Mapping[str, str]) -> Path:
+    configured = _clean(process_env.get("CLAUDE_CONFIG_DIR"))
+    if configured:
+        return Path(configured).expanduser()
+    home = _clean(process_env.get("HOME"))
+    return Path(home).expanduser() / ".claude" if home else Path.home() / ".claude"
 
 
 def _normalized_path(value: str | os.PathLike[str]) -> Path:
@@ -213,6 +277,51 @@ def _open_transcripts(pid: int, process_env: Mapping[str, str] | None = None) ->
         except OSError:
             continue
     return [path for _, path in sorted(paths, reverse=True)]
+
+
+def claude_session_record(
+    pid: int, process_env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Read Claude Code's per-process session file and verify it owns ``pid``.
+
+    Claude Code does not keep its transcript open, so process correlation uses
+    the state file it maintains under ``<claude home>/sessions/<pid>.json``. A
+    recorded process start time rejects a file left behind by a reused PID.
+    """
+
+    env = _proc_environ(pid) if process_env is None else process_env
+    path = _claude_home(env) / "sessions" / f"{pid}.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(record, dict) or _as_int(record.get("pid")) != pid:
+        return {}
+    recorded_start = _as_int(record.get("procStart"))
+    if recorded_start > 0 and process_start_time(pid) != recorded_start:
+        return {}
+    return record
+
+
+def claude_transcripts_for_session(
+    session_id: str, process_env: Mapping[str, str] | None = None
+) -> list[str]:
+    """Return transcript paths Claude Code records for one session id."""
+
+    session_id = _clean(session_id)
+    if not session_id or "/" in session_id or session_id.startswith("."):
+        return []
+    env = os.environ if process_env is None else process_env
+    root = _normalized_path(_claude_home(env) / "projects")
+    try:
+        return sorted(str(path) for path in root.glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        return []
+
+
+def _claude_transcripts(pid: int, process_env: Mapping[str, str]) -> list[str]:
+    record = claude_session_record(pid, process_env)
+    return claude_transcripts_for_session(record.get("sessionId"), process_env)
 
 
 def _transcript_session_id(path: str) -> str:
@@ -274,13 +383,63 @@ def _resume_session_id(pid: int) -> str:
     return ""
 
 
+def _claude_resume_session_id(pid: int) -> str:
+    parts = _proc_cmdline(pid)
+    for index, value in enumerate(parts[1:], start=1):
+        if value.startswith("--resume="):
+            return _clean(value.split("=", 1)[1])
+        if value in CLAUDE_RESUME_FLAGS and index + 1 < len(parts):
+            return _clean(parts[index + 1])
+    return ""
+
+
+def resume_session_id(pid: int, kind: str) -> str:
+    if kind == AGENT_CLAUDE:
+        return _claude_resume_session_id(pid)
+    return _resume_session_id(pid)
+
+
 def _same_path(first: str, second: str) -> bool:
     if not first or not second:
         return False
     return _normalized_path(first) == _normalized_path(second)
 
 
-def _candidate(pid: int, payload: Mapping[str, Any]) -> dict[str, Any] | None:
+def _score(
+    pid: int,
+    kind: str,
+    payload: Mapping[str, Any],
+    process_env: Mapping[str, str],
+) -> int:
+    """Rank how strongly one live agent process matches a hook payload."""
+
+    session_id = _clean(payload.get("session_id"))
+    transcript_path = _clean(payload.get("transcript_path"))
+    if kind == AGENT_CLAUDE:
+        recorded = _clean(claude_session_record(pid, process_env).get("sessionId"))
+        if recorded:
+            transcripts = claude_transcripts_for_session(recorded, process_env)
+            if transcript_path and any(
+                _same_path(transcript_path, path) for path in transcripts
+            ):
+                return 400
+            if session_id and session_id == recorded:
+                return 300
+        if session_id and _claude_resume_session_id(pid) == session_id:
+            return 200
+        return 0
+
+    transcripts = _open_transcripts(pid, process_env)
+    if transcript_path and any(_same_path(transcript_path, path) for path in transcripts):
+        return 400
+    if session_id and any(_transcript_session_id(path) == session_id for path in transcripts):
+        return 300
+    if session_id and _resume_session_id(pid) == session_id:
+        return 200
+    return 0
+
+
+def _candidate(pid: int, kind: str, payload: Mapping[str, Any]) -> dict[str, Any] | None:
     process_env = _proc_environ(pid)
     socket, expected_server_pid = _tmux_identity(process_env)
     pane = _clean(process_env.get("TMUX_PANE"))
@@ -288,21 +447,13 @@ def _candidate(pid: int, payload: Mapping[str, Any]) -> dict[str, Any] | None:
     if context is None:
         return None
 
-    session_id = _clean(payload.get("session_id"))
-    transcript_path = _clean(payload.get("transcript_path"))
-    transcripts = _open_transcripts(pid, process_env)
-    score = 0
-    if transcript_path and any(_same_path(transcript_path, path) for path in transcripts):
-        score = 400
-    elif session_id and any(_transcript_session_id(path) == session_id for path in transcripts):
-        score = 300
-    elif session_id and _resume_session_id(pid) == session_id:
-        score = 200
+    score = _score(pid, kind, payload, process_env)
     if score == 0:
         return None
 
     return {
         **context,
+        "agent_kind": kind,
         "agent_pid": pid,
         "agent_start_time": process_start_time(pid),
         "score": score,
@@ -314,6 +465,27 @@ def _direct_target(env: Mapping[str, str]) -> dict[str, Any] | None:
     socket, expected_server_pid = _tmux_identity(env)
     pane = _clean(env.get("TMUX_PANE"))
     return _tmux_probe(socket, pane, expected_server_pid)
+
+
+def _ancestor_target(pids: list[tuple[int, str]]) -> dict[str, Any] | None:
+    """Return the nearest live tmux target inherited by a parent agent process."""
+
+    for pid, kind in pids:
+        process_env = _proc_environ(pid)
+        socket, expected_server_pid = _tmux_identity(process_env)
+        pane = _clean(process_env.get("TMUX_PANE"))
+        context = _tmux_probe(socket, pane, expected_server_pid)
+        if context is None:
+            continue
+        return {
+            **context,
+            "agent_kind": kind,
+            "agent_pid": pid,
+            "agent_start_time": process_start_time(pid),
+            "score": 600,
+            "ambiguous": False,
+        }
+    return None
 
 
 def _choose(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -343,18 +515,21 @@ def resolve_hook_target_details(
     """Resolve a hook target and include process identity used for cache expiry.
 
     A direct ``TMUX`` and ``TMUX_PANE`` pair is accepted only after a live tmux
-    probe verifies the server PID and pane. When the hook process does not
-    inherit tmux variables, the resolver correlates the hook session or
-    transcript with live Codex processes. Equal-scoring matches in different
-    panes are reported as ambiguous and are not acted on.
+    probe verifies the server PID and pane. When hook subprocesses omit those
+    variables, their nearest Codex or Claude ancestor is authoritative because
+    it is the process that launched the lifecycle hook. Session/transcript
+    correlation is retained as a fallback for detached hook runners. Equal
+    scoring matches in different panes are reported as ambiguous and are not
+    acted on.
     """
 
     data: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
     environment: Mapping[str, str] = os.environ if env is None else env
     direct = _direct_target(environment)
+    ancestor_pids = _ancestor_agent_pids()
 
     if direct is not None:
-        for pid in _ancestor_codex_pids():
+        for pid, kind in ancestor_pids:
             process_env = _proc_environ(pid)
             socket, expected_server_pid = _tmux_identity(process_env)
             pane = _clean(process_env.get("TMUX_PANE"))
@@ -364,6 +539,7 @@ def resolve_hook_target_details(
                 continue
             return {
                 **direct,
+                "agent_kind": kind,
                 "agent_pid": pid,
                 "agent_start_time": process_start_time(pid),
                 "score": 500,
@@ -372,8 +548,8 @@ def resolve_hook_target_details(
 
         matching = [
             candidate
-            for pid in _codex_pids()
-            if (candidate := _candidate(pid, data)) is not None
+            for pid, kind in _agent_pids()
+            if (candidate := _candidate(pid, kind, data)) is not None
             and candidate["socket"] == direct["socket"]
             and candidate["pane"] == direct["pane"]
         ]
@@ -382,11 +558,16 @@ def resolve_hook_target_details(
             return chosen
         return {
             **direct,
+            "agent_kind": "",
             "agent_pid": -1,
             "agent_start_time": -1,
             "score": 100,
             "ambiguous": False,
         }
+
+    ancestor = _ancestor_target(ancestor_pids)
+    if ancestor is not None:
+        return ancestor
 
     session_id = _clean(data.get("session_id"))
     transcript_path = _clean(data.get("transcript_path"))
@@ -395,8 +576,8 @@ def resolve_hook_target_details(
 
     candidates = [
         candidate
-        for pid in _codex_pids()
-        if (candidate := _candidate(pid, data)) is not None
+        for pid, kind in _agent_pids()
+        if (candidate := _candidate(pid, kind, data)) is not None
     ]
     return _choose(candidates)
 
@@ -411,11 +592,15 @@ def resolve_hook_target(
     return _clean(target.get("socket")), _clean(target.get("pane"))
 
 
-def codex_processes_for_target(socket: str = "", pane: str = "") -> list[dict[str, Any]]:
-    """Return live, validated Codex process contexts for an optional tmux target."""
+def agent_processes_for_target(
+    socket: str = "", pane: str = "", kind: str = ""
+) -> list[dict[str, Any]]:
+    """Return live, validated agent process contexts for an optional tmux target."""
 
     result: list[dict[str, Any]] = []
-    for pid in _codex_pids():
+    for pid, process_kind in _agent_pids():
+        if kind and process_kind != kind:
+            continue
         process_env = _proc_environ(pid)
         process_socket, expected_server_pid = _tmux_identity(process_env)
         process_pane = _clean(process_env.get("TMUX_PANE"))
@@ -426,13 +611,23 @@ def codex_processes_for_target(socket: str = "", pane: str = "") -> list[dict[st
         target = _tmux_probe(process_socket, process_pane, expected_server_pid)
         if target is None:
             continue
+        if process_kind == AGENT_CLAUDE:
+            session = claude_session_record(pid, process_env)
+            transcripts = claude_transcripts_for_session(
+                session.get("sessionId"), process_env
+            )
+        else:
+            session = {}
+            transcripts = _open_transcripts(pid, process_env)
         result.append(
             {
                 **target,
+                "agent_kind": process_kind,
                 "agent_pid": pid,
                 "agent_start_time": process_start_time(pid),
-                "transcripts": _open_transcripts(pid, process_env),
-                "resume": _resume_session_id(pid),
+                "transcripts": transcripts,
+                "resume": resume_session_id(pid, process_kind),
+                "session": session,
             }
         )
     return result

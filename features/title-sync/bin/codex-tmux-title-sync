@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -24,18 +25,43 @@ if str(SHARED_CONTEXT) not in sys.path:
     sys.path.insert(0, str(SHARED_CONTEXT))
 
 from agent_tmux_context import (  # noqa: E402
-    codex_processes_for_target,
+    AGENT_CLAUDE,
+    AGENT_CODEX,
+    agent_processes_for_target,
+    claude_session_record,
+    claude_transcripts_for_session,
     process_is_alive,
+    process_start_time,
     resolve_hook_target_details,
 )
 
 MAX_TITLE = 48
 TMUX_TIMEOUT_SECONDS = 1.0
 PIDLESS_STATE_TTL_SECONDS = 60
+WATCH_INTERVAL_SECONDS = 0.5
+WATCH_START_GRACE_SECONDS = 10.0
+WATCH_CONTEXT_GRACE_SECONDS = 10.0
+WATCH_RECONCILE_INTERVAL_SECONDS = 2.0
+WATCHER_VERSION = 2
+GENERIC_WINDOW_TITLES = {"codex", "claude"}
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSION_INDEX_PATH = CODEX_HOME / "session_index.jsonl"
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+CLAUDE_SESSIONS_ROOT = CLAUDE_HOME / "sessions"
+CLAUDE_PROJECTS_ROOT = CLAUDE_HOME / "projects"
+# Claude Code appends one ``ai-title`` record per assistant turn, so the newest
+# chat title is always near the end of a transcript.
+CLAUDE_TITLE_SCAN_LINES = 200
 CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
 STATE_ROOT = CACHE_HOME / "codex-tmux-integration" / "title-sync"
+SESSION_REGISTRY_PATH = Path(
+    os.environ.get(
+        "CODEX_SESSION_REGISTRY",
+        Path.home() / ".local/state/codex-tmux-integration/sessions.json",
+    )
+)
+SESSION_REGISTRY_SCHEMA = "codex.session-registry.v1"
+SESSION_REGISTRY_SOURCE = "session-listener"
 LOG_PATH = Path(
     os.environ.get(
         "CODEX_TMUX_TITLE_LOG",
@@ -46,6 +72,14 @@ LOG_MAX_BYTES = 512 * 1024
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+RENAMED_SESSION_RE = re.compile(
+    r"Session renamed to (?P<title>.+?)\. To resume this session run codex resume,\s*"
+    r"then select .+? \((?P<session>[0-9a-fA-F-]{36})\)"
+)
+STATUS_SESSION_RE = re.compile(
+    r"\bSession:\s*(?P<session>[0-9a-fA-F-]{36})\b"
+)
+STATUS_MODE_RE = re.compile(r"^(?:Main|Plan)\s+\[[^\]]+\](?:\s+.*)?$")
 
 
 def log(message: Any) -> None:
@@ -230,6 +264,14 @@ def lock_path(socket: str, server_pid: int, window: str) -> Path:
     return _server_root(socket, server_pid) / "locks" / f"{safe_key(window)}.lock"
 
 
+def watcher_state_path(socket: str, server_pid: int, pane: str) -> Path:
+    return _server_root(socket, server_pid) / "watchers" / f"{safe_key(pane)}.json"
+
+
+def watcher_lock_path(socket: str, server_pid: int, pane: str) -> Path:
+    return _server_root(socket, server_pid) / "watchers" / f"{safe_key(pane)}.lock"
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
@@ -273,6 +315,8 @@ def cache_pane_title(
     *,
     agent_pid: int = -1,
     agent_start_time: int = -1,
+    provisional: bool = False,
+    source: str = "",
 ) -> bool:
     context = pane_context(pane, socket=socket)
     if context is None or not title or context["pane_dead"]:
@@ -288,6 +332,8 @@ def cache_pane_title(
         "session_id": clean(session_id),
         "agent_pid": agent_pid,
         "agent_start_time": agent_start_time,
+        "provisional": provisional,
+        "source": clean(source),
         "updated_at_ns": time.time_ns(),
     }
     try:
@@ -307,8 +353,11 @@ def _delete_state(path: Path) -> None:
         pass
 
 
-def cached_pane_state(socket: str, pane: str) -> dict[str, Any] | None:
-    context = pane_context(pane, socket=socket)
+def _cached_pane_state_for_context(
+    socket: str,
+    pane: str,
+    context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if context is None or context["pane_dead"]:
         return None
     path = pane_state_path(socket, context["server_pid"], pane)
@@ -337,6 +386,14 @@ def cached_pane_state(socket: str, pane: str) -> dict[str, Any] | None:
             return None
     title = shorten(payload.get("title"))
     return payload if title else None
+
+
+def cached_pane_state(socket: str, pane: str) -> dict[str, Any] | None:
+    return _cached_pane_state_for_context(
+        socket,
+        pane,
+        pane_context(pane, socket=socket),
+    )
 
 
 def cached_pane_title(socket: str, pane: str) -> str:
@@ -380,6 +437,39 @@ def thread_name_for_session(session_id: str) -> str:
     return ""
 
 
+def file_stamp(path: Path) -> tuple[int, int]:
+    """Return a cheap change token for one file without reading it."""
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0)
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def session_index_stamp() -> tuple[int, int]:
+    return file_stamp(SESSION_INDEX_PATH)
+
+
+def read_session_registry(path: Path = SESSION_REGISTRY_PATH) -> dict[str, Any] | None:
+    """Read only the private metadata registry produced by the eBPF listener."""
+
+    try:
+        metadata = path.stat()
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != SESSION_REGISTRY_SCHEMA:
+        return None
+    return payload if isinstance(payload.get("connections"), dict) else None
+
+
+def session_registry_active(path: Path = SESSION_REGISTRY_PATH) -> bool:
+    return read_session_registry(path) is not None
+
+
 def session_id_from_transcript(path: str | Path) -> str:
     try:
         with Path(path).open("r", encoding="utf-8", errors="replace") as stream:
@@ -398,7 +488,77 @@ def session_id_from_transcript(path: str | Path) -> str:
     return ""
 
 
+def claude_transcript_title(path: str | Path) -> str:
+    """Return the newest chat title Claude Code recorded in one transcript."""
+
+    if not path:
+        return ""
+    try:
+        for index, line in enumerate(_reverse_lines(Path(path))):
+            if index >= CLAUDE_TITLE_SCAN_LINES:
+                break
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") == "ai-title":
+                return clean(record.get("aiTitle"))
+    except OSError:
+        return ""
+    return ""
+
+
+def claude_transcript_for_session(session_id: str) -> str:
+    paths = claude_transcripts_for_session(session_id, os.environ)
+    return paths[0] if paths else ""
+
+
+def claude_session_title(
+    session_id: str,
+    transcript_path: str | Path = "",
+    record: dict[str, Any] | None = None,
+) -> str:
+    """Prefer a name the user chose, then Claude's own chat title."""
+
+    record = record or {}
+    name = shorten(record.get("name"))
+    if name and clean(record.get("nameSource")) not in {"", "derived"}:
+        return name
+    title = shorten(claude_transcript_title(transcript_path))
+    if title:
+        return title
+    if name:
+        return name
+    session_id = clean(session_id)
+    if session_id:
+        return shorten(f"claude-{session_id.split('-', 1)[0][:8]}")
+    return "claude"
+
+
+def claude_observation(agent_pid: int, transcript: str = "") -> tuple[str, str]:
+    """Read a live Claude session name without capturing its pane."""
+
+    record = claude_session_record(agent_pid)
+    session_id = clean(record.get("sessionId"))
+    if not session_id:
+        return "", ""
+    transcript = transcript or claude_transcript_for_session(session_id)
+    return claude_session_title(session_id, transcript, record), session_id
+
+
+def derive_claude_title(process: dict[str, Any]) -> tuple[str, str]:
+    record = process.get("session") or {}
+    session_id = clean(record.get("sessionId")) or clean(process.get("resume"))
+    transcripts = [str(path) for path in process.get("transcripts", [])]
+    title = claude_session_title(
+        session_id, transcripts[0] if transcripts else "", record
+    )
+    return shorten(title), session_id
+
+
 def derive_process_title(process: dict[str, Any]) -> tuple[str, str]:
+    if clean(process.get("agent_kind")) == AGENT_CLAUDE:
+        return derive_claude_title(process)
     transcripts = [str(path) for path in process.get("transcripts", [])]
     for transcript in transcripts:
         session_id = session_id_from_transcript(transcript)
@@ -415,16 +575,469 @@ def derive_process_title(process: dict[str, Any]) -> tuple[str, str]:
     return "codex", ""
 
 
-def title_for_hook(payload: dict[str, Any]) -> tuple[str, str]:
+def path_is_under(path: str | Path, root: Path) -> bool:
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+        resolved.relative_to(root.expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def hook_agent_kind(payload: dict[str, Any], target: dict[str, Any]) -> str:
+    """Identify which agent produced one hook payload.
+
+    The resolved process identity is authoritative. A detached hook runner may
+    leave it empty, in which case the transcript location still separates the
+    two agents because each writes below its own home directory.
+    """
+
+    kind = clean(target.get("agent_kind"))
+    if kind:
+        return kind
+    transcript = clean(payload.get("transcript_path"))
+    if transcript:
+        if path_is_under(transcript, CLAUDE_PROJECTS_ROOT):
+            return AGENT_CLAUDE
+        if path_is_under(transcript, CODEX_HOME / "sessions"):
+            return AGENT_CODEX
+    return AGENT_CODEX
+
+
+def title_for_hook(
+    payload: dict[str, Any],
+    kind: str = AGENT_CODEX,
+    agent_pid: int = -1,
+) -> tuple[str, str]:
     session_id = clean(payload.get("session_id"))
     if not session_id:
         return "", ""
+    if kind == AGENT_CLAUDE:
+        record = claude_session_record(agent_pid) if agent_pid > 0 else {}
+        if clean(record.get("sessionId")) != session_id:
+            record = {}
+        transcript = clean(payload.get("transcript_path")) or (
+            claude_transcript_for_session(session_id)
+        )
+        return claude_session_title(session_id, transcript, record), session_id
     name = thread_name_for_session(session_id)
     return shorten(name or f"codex-{session_id.split('-', 1)[0][:8]}"), session_id
 
 
+def codex_status_from_capture(raw: str) -> tuple[str, str]:
+    """Read the current chat title and any explicit session id from Codex TUI."""
+
+    lines = [clean(line) for line in str(raw or "").splitlines()]
+    status_title = ""
+    for line in reversed(lines):
+        before_mode, separator, mode = line.rpartition(" · ")
+        if not separator or STATUS_MODE_RE.fullmatch(mode) is None:
+            continue
+        _, title_separator, candidate = before_mode.rpartition(" · ")
+        if title_separator:
+            status_title = clean(candidate)
+            break
+    if UUID_RE.fullmatch(status_title):
+        return status_title, status_title
+
+    # Codex 0.147 no longer includes the chat title/UUID in its footer. Use
+    # explicit identity emitted by `/status` or `/rename` instead. Normalize
+    # the whole capture because the rename notification can wrap across rows.
+    normalized = clean(raw)
+    explicit: list[tuple[int, str, str, str]] = []
+    for match in STATUS_SESSION_RE.finditer(normalized):
+        explicit.append((match.start(), "status", "", clean(match.group("session"))))
+    for match in RENAMED_SESSION_RE.finditer(normalized):
+        explicit.append(
+            (
+                match.start(),
+                "rename",
+                clean(match.group("title")),
+                clean(match.group("session")),
+            )
+        )
+    if explicit:
+        _, source, explicit_title, session_id = max(explicit, key=lambda item: item[0])
+        if UUID_RE.fullmatch(session_id):
+            if source == "status":
+                return status_title or session_id, session_id
+            if not status_title or status_title == explicit_title:
+                return explicit_title, session_id
+    return status_title, ""
+
+
+def pane_codex_status(socket: str, pane: str) -> tuple[str, str]:
+    raw = tmux(
+        "capture-pane",
+        "-p",
+        "-J",
+        "-t",
+        pane,
+        "-S",
+        "-30",
+        socket=socket,
+    )
+    return codex_status_from_capture(raw)
+
+
+def apply_pane_observation(
+    socket: str,
+    pane: str,
+    status_title: str,
+    observed_session_id: str,
+    *,
+    agent_pid: int,
+    agent_start_time: int,
+    window: str = "",
+    agent_kind: str = AGENT_CODEX,
+) -> int:
+    """Cache one same-pane observation and reconcile its owning window."""
+
+    status_title = shorten(status_title)
+    if not status_title:
+        return 0
+    state = cached_pane_state(socket, pane)
+    session_id = clean(observed_session_id)
+    title = status_title
+    if agent_kind != AGENT_CLAUDE:
+        if not session_id and state is not None:
+            previous_session = clean(state.get("session_id"))
+            if previous_session and thread_name_for_session(previous_session) == status_title:
+                session_id = previous_session
+        if UUID_RE.fullmatch(status_title):
+            session_id = status_title
+            name = thread_name_for_session(session_id)
+            title = shorten(name or f"codex-{session_id.split('-', 1)[0][:8]}")
+
+    if (
+        state is not None
+        and shorten(state.get("title")) == title
+        and clean(state.get("session_id")) == session_id
+        and as_int(state.get("agent_pid")) == agent_pid
+        and as_int(state.get("agent_start_time")) == agent_start_time
+        and not bool(state.get("provisional"))
+    ):
+        current_name = window_name(window, socket) if window else ""
+        if current_name in GENERIC_WINDOW_TITLES and current_name != title:
+            return reconcile_window(socket, window)
+        return 0
+    if not cache_pane_title(
+        socket,
+        pane,
+        title,
+        session_id,
+        agent_pid=agent_pid,
+        agent_start_time=agent_start_time,
+    ):
+        return 0
+    if not window:
+        context = pane_context(pane, socket=socket)
+        window = clean((context or {}).get("window_id"))
+    return reconcile_window(socket, window) if window else 0
+
+
+def bound_session_observation(
+    socket: str,
+    pane: str,
+    *,
+    agent_pid: int,
+    agent_start_time: int,
+    context: dict[str, Any] | None = None,
+) -> tuple[str, str] | None:
+    """Read a bound pane's current title directly from the session index."""
+
+    state = (
+        _cached_pane_state_for_context(socket, pane, context)
+        if context is not None
+        else cached_pane_state(socket, pane)
+    )
+    if state is None or bool(state.get("provisional")):
+        return None
+    session_id = clean(state.get("session_id"))
+    if UUID_RE.fullmatch(session_id) is None:
+        return None
+
+    state_agent_pid = as_int(state.get("agent_pid"))
+    state_agent_start_time = as_int(state.get("agent_start_time"))
+    if state_agent_pid > 0 and (
+        state_agent_pid != agent_pid
+        or (
+            state_agent_start_time > 0
+            and state_agent_start_time != agent_start_time
+        )
+    ):
+        return None
+
+    title = thread_name_for_session(session_id) or shorten(state.get("title"))
+    return (shorten(title), session_id) if title else None
+
+
+def watcher_observation(
+    socket: str,
+    pane: str,
+    *,
+    agent_pid: int,
+    agent_start_time: int,
+    context: dict[str, Any] | None = None,
+    verify_bound_session: bool = False,
+) -> tuple[str, str]:
+    """Use the index after binding, rechecking identity only when requested."""
+
+    indexed = bound_session_observation(
+        socket,
+        pane,
+        agent_pid=agent_pid,
+        agent_start_time=agent_start_time,
+        context=context,
+    )
+    if indexed is None:
+        return pane_codex_status(socket, pane)
+    if not verify_bound_session:
+        return indexed
+    captured = pane_codex_status(socket, pane)
+    captured_session = clean(captured[1])
+    if UUID_RE.fullmatch(captured_session) and captured_session != indexed[1]:
+        return captured
+    return indexed
+
+
+def agent_state_stamp(kind: str, agent_pid: int, transcript: str = "") -> tuple[Any, ...]:
+    """Return a change token for the state that names one live agent session."""
+
+    if kind == AGENT_CLAUDE:
+        return (
+            file_stamp(CLAUDE_SESSIONS_ROOT / f"{agent_pid}.json"),
+            file_stamp(Path(transcript)) if transcript else (0, 0),
+        )
+    return session_index_stamp()
+
+
+def _newest_agent_process(socket: str, pane: str) -> dict[str, Any] | None:
+    processes = agent_processes_for_target(socket, pane)
+    if not processes:
+        return None
+    return max(
+        processes,
+        key=lambda process: (
+            as_int(process.get("agent_start_time")),
+            as_int(process.get("agent_pid")),
+        ),
+    )
+
+
+def watch_pane(socket: str, pane: str) -> int:
+    """Follow one launched agent CLI until its process exits."""
+
+    context = pane_context(pane, socket=socket)
+    server_pid = as_int((context or {}).get("server_pid"))
+    if server_pid <= 0:
+        return 0
+    lock_file = watcher_lock_path(socket, server_pid, pane)
+    lock_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tracked: dict[str, Any] | None = None
+    window = clean((context or {}).get("window_id"))
+    registration = watcher_state_path(socket, server_pid, pane)
+    unavailable_since: float | None = None
+    stop_reason = "unknown"
+    agent_kind = AGENT_CODEX
+    agent_transcript = ""
+    last_state_stamp: tuple[Any, ...] | None = None
+
+    with lock_file.open("a+", encoding="utf-8") as stream:
+        os.chmod(lock_file, 0o600)
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        atomic_write_json(
+            registration,
+            {
+                "version": WATCHER_VERSION,
+                "pid": os.getpid(),
+                "start_time": process_start_time(os.getpid()),
+                "socket": socket,
+                "server_pid": server_pid,
+                "pane": pane,
+            },
+        )
+        deadline = time.monotonic() + WATCH_START_GRACE_SECONDS
+        last_observation: tuple[str, str] | None = None
+        last_reconcile_check = 0.0
+        try:
+            while True:
+                context = pane_context(pane, socket=socket)
+                if context is None:
+                    now = time.monotonic()
+                    unavailable_since = unavailable_since or now
+                    if now - unavailable_since >= WATCH_CONTEXT_GRACE_SECONDS:
+                        stop_reason = "pane-unavailable"
+                        break
+                    time.sleep(WATCH_INTERVAL_SECONDS)
+                    continue
+                unavailable_since = None
+                if context["pane_dead"]:
+                    stop_reason = "pane-dead"
+                    break
+                if as_int(context.get("server_pid")) != server_pid:
+                    stop_reason = "server-changed"
+                    break
+                window = clean(context.get("window_id")) or window
+                if tracked is None:
+                    tracked = _newest_agent_process(socket, pane)
+                    if tracked is None:
+                        if time.monotonic() >= deadline:
+                            stop_reason = "no-agent-process"
+                            break
+                        time.sleep(WATCH_INTERVAL_SECONDS)
+                        continue
+                    agent_kind = clean(tracked.get("agent_kind")) or AGENT_CODEX
+                    if agent_kind == AGENT_CODEX:
+                        stop_reason = "codex-listener-authoritative"
+                        break
+                    transcripts = [
+                        str(item) for item in tracked.get("transcripts", [])
+                    ]
+                    agent_transcript = transcripts[0] if transcripts else ""
+                agent_pid = as_int(tracked.get("agent_pid"))
+                agent_start_time = as_int(tracked.get("agent_start_time"))
+                if not process_is_alive(agent_pid, agent_start_time):
+                    stop_reason = "process-exited"
+                    break
+                current_stamp = agent_state_stamp(
+                    agent_kind, agent_pid, agent_transcript
+                )
+                stamp_changed = current_stamp != last_state_stamp
+                last_state_stamp = current_stamp
+                if agent_kind == AGENT_CLAUDE:
+                    # Claude Code draws no parsable status line. Its session
+                    # state file and transcript are authoritative and cheap to
+                    # stat, so re-read them only after one of them changes.
+                    observation = (
+                        claude_observation(agent_pid, agent_transcript)
+                        if stamp_changed or last_observation is None
+                        else last_observation
+                    )
+                else:
+                    observation = watcher_observation(
+                        socket,
+                        pane,
+                        agent_pid=agent_pid,
+                        agent_start_time=agent_start_time,
+                        context=context,
+                        verify_bound_session=stamp_changed,
+                    )
+                now = time.monotonic()
+                if observation[0] and (
+                    observation != last_observation
+                    or now - last_reconcile_check
+                    >= WATCH_RECONCILE_INTERVAL_SECONDS
+                ):
+                    apply_pane_observation(
+                        socket,
+                        pane,
+                        *observation,
+                        agent_pid=agent_pid,
+                        agent_start_time=agent_start_time,
+                        window=window,
+                        agent_kind=agent_kind,
+                    )
+                    last_observation = observation
+                    last_reconcile_check = now
+                time.sleep(WATCH_INTERVAL_SECONDS)
+        finally:
+            registered = read_json(registration)
+            if registered and as_int(registered.get("pid")) == os.getpid():
+                _delete_state(registration)
+
+    log(
+        f"watcher stopped socket={socket!r} pane={pane} "
+        f"reason={stop_reason}"
+    )
+    if (
+        tracked is not None
+        and stop_reason in {"pane-dead", "process-exited"}
+        and current_server_pid(socket) == server_pid
+    ):
+        state = read_json(pane_state_path(socket, server_pid, pane))
+        if state and (
+            as_int(state.get("agent_pid")) == as_int(tracked.get("agent_pid"))
+            and as_int(state.get("agent_start_time"))
+            == as_int(tracked.get("agent_start_time"))
+        ):
+            cached_window = clear_pane_state(socket, pane)
+            if window or cached_window:
+                reconcile_window_from_cache(socket, window or cached_window)
+    return 0
+
+
+def ensure_pane_watcher(socket: str, pane: str) -> bool:
+    """Start a detached same-pane observer unless one is already alive."""
+
+    if session_registry_active():
+        return False
+
+    context = pane_context(pane, socket=socket)
+    server_pid = as_int((context or {}).get("server_pid"))
+    if server_pid <= 0:
+        return False
+    registered = read_json(watcher_state_path(socket, server_pid, pane))
+    if registered and process_is_alive(
+        as_int(registered.get("pid")),
+        as_int(registered.get("start_time")),
+    ):
+        if as_int(registered.get("version"), 0) >= WATCHER_VERSION:
+            return False
+        watcher_pid = as_int(registered.get("pid"))
+        try:
+            os.kill(watcher_pid, signal.SIGTERM)
+        except OSError:
+            return False
+        deadline = time.monotonic() + 1.0
+        while process_is_alive(
+            watcher_pid,
+            as_int(registered.get("start_time")),
+        ):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--socket",
+                socket,
+                "--pane",
+                pane,
+                "--watch-pane",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def ensure_window_watcher(socket: str, window: str) -> bool:
+    """Backfill an observer for the active Claude pane in one window."""
+
+    pane = window_active_pane(window, socket)
+    process = _newest_agent_process(socket, pane) if pane else None
+    if process is None or clean(process.get("agent_kind")) != AGENT_CLAUDE:
+        return False
+    return ensure_pane_watcher(socket, pane)
+
+
 def discover_pane_state(socket: str, pane: str) -> dict[str, Any] | None:
-    processes = codex_processes_for_target(socket, pane)
+    processes = [
+        process
+        for process in agent_processes_for_target(socket, pane)
+        if clean(process.get("agent_kind")) == AGENT_CLAUDE
+    ]
     if not processes:
         return None
     newest = max(
@@ -483,7 +1096,10 @@ def _apply_window_state(
         }
     else:
         last_applied = clean(state.get("last_applied"))
-        if current_name not in {last_applied, shorten(title)}:
+        if (
+            current_name not in {last_applied, shorten(title)}
+            and current_name not in GENERIC_WINDOW_TITLES
+        ):
             state["original_name"] = current_name
 
     if not rename_window(window, title, socket):
@@ -533,7 +1149,7 @@ def _restore_window_state(socket: str, server_pid: int, window: str) -> bool:
     return True
 
 
-def reconcile_window(socket: str, window: str) -> int:
+def _reconcile_window(socket: str, window: str, *, allow_discovery: bool) -> int:
     socket = clean(socket)
     window = clean(window)
     server_pid = current_server_pid(socket)
@@ -545,7 +1161,7 @@ def reconcile_window(socket: str, window: str) -> int:
             _delete_state(window_state_path(socket, server_pid, window))
             return 0
         state = cached_pane_state(socket, active_pane)
-        if state is None:
+        if state is None and allow_discovery:
             state = discover_pane_state(socket, active_pane)
         if state is None:
             return int(_restore_window_state(socket, server_pid, window))
@@ -560,6 +1176,18 @@ def reconcile_window(socket: str, window: str) -> int:
         )
 
 
+def reconcile_window(socket: str, window: str) -> int:
+    return _reconcile_window(
+        socket,
+        window,
+        allow_discovery=not session_registry_active(),
+    )
+
+
+def reconcile_window_from_cache(socket: str, window: str) -> int:
+    return _reconcile_window(socket, window, allow_discovery=False)
+
+
 def clear_pane_state(socket: str, pane: str) -> str:
     server_pid = current_server_pid(socket)
     if server_pid <= 0:
@@ -568,6 +1196,35 @@ def clear_pane_state(socket: str, pane: str) -> str:
     payload = read_json(path) or {}
     _delete_state(path)
     return clean(payload.get("window_id"))
+
+
+def mark_pane_starting(socket: str, pane: str, title: str = "codex") -> int:
+    """Apply a provisional title before the agent session lifecycle exists."""
+
+    context = pane_context(pane, socket=socket)
+    window = clean((context or {}).get("window_id"))
+    if not window or not cache_pane_title(
+        socket,
+        pane,
+        shorten(title or "codex"),
+        provisional=True,
+    ):
+        return 0
+    return reconcile_window(socket, window)
+
+
+def finish_pane_starting(socket: str, pane: str) -> int:
+    """Clear only a provisional launch title when the owning shell returns."""
+
+    context = pane_context(pane, socket=socket)
+    window = clean((context or {}).get("window_id"))
+    if not window:
+        return 0
+    state = cached_pane_state(socket, pane)
+    if state is None or not bool(state.get("provisional")):
+        return 0
+    clear_pane_state(socket, pane)
+    return reconcile_window_from_cache(socket, window)
 
 
 def clear_session_state(session_id: str) -> int:
@@ -607,7 +1264,117 @@ def cleanup_server(socket: str) -> int:
 
 def sync_all(socket: str) -> int:
     windows = tmux("list-windows", "-a", "-F", "#{window_id}", socket=socket)
-    return sum(reconcile_window(socket, window) for window in windows.splitlines() if window)
+    reconciled = 0
+    for window in windows.splitlines():
+        if not window:
+            continue
+        reconciled += reconcile_window(socket, window)
+        ensure_window_watcher(socket, window)
+    return reconciled
+
+
+def sync_session_registry(
+    path: Path = SESSION_REGISTRY_PATH,
+    *,
+    window_filter: tuple[str, str] | None = None,
+) -> int:
+    """Apply the listener registry without scanning Codex processes or screens."""
+
+    registry = read_session_registry(path)
+    if registry is None:
+        return 0
+    desired: set[tuple[str, int, str]] = set()
+    targets: set[tuple[str, str]] = set()
+    moved_windows: set[tuple[tuple[str, str], tuple[str, str]]] = set()
+    connections = registry.get("connections", {})
+    for connection in connections.values():
+        if not isinstance(connection, dict):
+            continue
+        tmux_state = connection.get("tmux")
+        thread = connection.get("thread")
+        client = connection.get("client")
+        if not all(isinstance(item, dict) for item in (tmux_state, thread, client)):
+            continue
+        socket = clean(tmux_state.get("socket"))
+        pane = clean(tmux_state.get("pane"))
+        server_pid = as_int(tmux_state.get("server_pid"))
+        pane_pid = as_int(tmux_state.get("pane_pid"))
+        thread_id = clean(thread.get("id"))
+        if not socket.startswith("/") or not pane.startswith("%") or not thread_id:
+            continue
+        if current_server_pid(socket) != server_pid:
+            continue
+        context = pane_context(pane, socket=socket)
+        if (
+            context is None
+            or context.get("pane_dead")
+            or as_int(context.get("server_pid")) != server_pid
+            or as_int(context.get("pane_pid")) != pane_pid
+        ):
+            continue
+        client_pid = as_int(client.get("pid"))
+        client_start = as_int(client.get("start_ticks"))
+        if not process_is_alive(client_pid, client_start):
+            continue
+        title = shorten(thread.get("name")) or shorten(
+            f"codex-{thread_id.split('-', 1)[0][:8]}"
+        )
+        previous = read_json(pane_state_path(socket, server_pid, pane)) or {}
+        previous_window = ""
+        if (
+            clean(previous.get("source")) == SESSION_REGISTRY_SOURCE
+            and clean(previous.get("socket")) == socket
+            and as_int(previous.get("server_pid")) == server_pid
+            and clean(previous.get("pane")) == pane
+            and as_int(previous.get("pane_pid")) == pane_pid
+        ):
+            previous_window = clean(previous.get("window_id"))
+        if not cache_pane_title(
+            socket,
+            pane,
+            title,
+            thread_id,
+            agent_pid=client_pid,
+            agent_start_time=client_start,
+            source=SESSION_REGISTRY_SOURCE,
+        ):
+            continue
+        desired.add((socket, server_pid, pane))
+        window = clean(context.get("window_id"))
+        if window:
+            targets.add((socket, window))
+            if previous_window and previous_window != window:
+                previous_target = (socket, previous_window)
+                current_target = (socket, window)
+                targets.add(previous_target)
+                moved_windows.add((previous_target, current_target))
+
+    for pane_path in STATE_ROOT.glob("servers/*/panes/*.json"):
+        cached = read_json(pane_path)
+        if not cached or clean(cached.get("source")) != SESSION_REGISTRY_SOURCE:
+            continue
+        key = (
+            clean(cached.get("socket")),
+            as_int(cached.get("server_pid")),
+            clean(cached.get("pane")),
+        )
+        if key in desired:
+            continue
+        window = clean(cached.get("window_id"))
+        _delete_state(pane_path)
+        if key[0] and window:
+            targets.add((key[0], window))
+
+    if window_filter is not None:
+        related = {window_filter}
+        for previous_target, current_target in moved_windows:
+            if window_filter in (previous_target, current_target):
+                related.update((previous_target, current_target))
+        targets &= related
+    return sum(
+        reconcile_window_from_cache(socket, window)
+        for socket, window in sorted(targets)
+    )
 
 
 def read_hook_payload() -> dict[str, Any] | None:
@@ -631,11 +1398,20 @@ def read_hook_payload() -> dict[str, Any] | None:
 
 
 def sync_hook(payload: dict[str, Any]) -> int:
+    if session_registry_active():
+        return sync_session_registry()
     event = clean(payload.get("hook_event_name"))
     session_id = clean(payload.get("session_id"))
     target = resolve_hook_target_details(payload, os.environ)
     if target.get("ambiguous"):
         log(f"ambiguous hook target event={event or '-'} session={session_id or '-'}")
+        return 0
+    kind = hook_agent_kind(payload, target)
+    if kind == AGENT_CODEX:
+        log(
+            f"ignored Codex hook without listener registry "
+            f"event={event or '-'} session={session_id or '-'}"
+        )
         return 0
     socket = clean(target.get("socket"))
     pane = clean(target.get("pane"))
@@ -651,7 +1427,9 @@ def sync_hook(payload: dict[str, Any]) -> int:
         cached_window = clear_pane_state(socket, pane)
         return reconcile_window(socket, window or cached_window) if window or cached_window else 0
 
-    title, session_id = title_for_hook(payload)
+    title, session_id = title_for_hook(
+        payload, kind, as_int(target.get("agent_pid"))
+    )
     if not title:
         return 0
     if not cache_pane_title(
@@ -669,8 +1447,25 @@ def sync_hook(payload: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pane")
-    parser.add_argument("--window")
+    parser.add_argument("--window", nargs="?")
     parser.add_argument("--socket")
+    parser.add_argument(
+        "--starting",
+        action="store_true",
+        help="apply a provisional title before a new Codex session exists",
+    )
+    parser.add_argument(
+        "--shell-ready",
+        action="store_true",
+        help="clear a provisional title after the launching shell returns",
+    )
+    parser.add_argument("--watch-pane", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--ensure-watcher", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--registry-sync", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--registry-file", type=Path, default=SESSION_REGISTRY_PATH, help=argparse.SUPPRESS
+    )
+    parser.add_argument("--title", default="codex", help=argparse.SUPPRESS)
     parser.add_argument("--all", action="store_true", help="reconcile all windows on one server")
     parser.add_argument("--pane-exited", action="store_true")
     parser.add_argument("--window-closed", action="store_true")
@@ -680,13 +1475,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.registry_sync:
+        sync_session_registry(args.registry_file)
+        return 0
     payload = read_hook_payload()
     if payload is not None:
         sync_hook(payload)
         return 0
 
     socket = clean(args.socket or tmux_socket_from_env(os.environ))
-    if args.cleanup and socket:
+    if args.watch_pane and socket and args.pane:
+        return watch_pane(socket, args.pane)
+    if args.ensure_watcher and socket and args.pane:
+        ensure_pane_watcher(socket, args.pane)
+    if args.starting and socket and args.pane:
+        mark_pane_starting(socket, args.pane, args.title)
+        ensure_pane_watcher(socket, args.pane)
+    elif args.shell_ready and socket and args.pane:
+        finish_pane_starting(socket, args.pane)
+    elif args.cleanup and socket:
         cleanup_server(socket)
     elif args.window_closed and socket and args.window:
         remove_window_state(socket, args.window)
@@ -696,13 +1503,22 @@ def main() -> int:
         if window:
             reconcile_window(socket, window)
     elif args.window and socket:
-        reconcile_window(socket, args.window)
+        if session_registry_active(args.registry_file):
+            sync_session_registry(args.registry_file, window_filter=(socket, clean(args.window)))
+        else:
+            reconcile_window(socket, args.window)
+        ensure_window_watcher(socket, args.window)
     elif args.pane and socket:
         context = pane_context(args.pane, socket=socket)
         if context and context["window_id"]:
             reconcile_window(socket, context["window_id"])
+            if _newest_agent_process(socket, args.pane) is not None:
+                ensure_pane_watcher(socket, args.pane)
     elif args.all and socket:
-        sync_all(socket)
+        if session_registry_active(args.registry_file):
+            sync_session_registry(args.registry_file)
+        else:
+            sync_all(socket)
     return 0
 
 

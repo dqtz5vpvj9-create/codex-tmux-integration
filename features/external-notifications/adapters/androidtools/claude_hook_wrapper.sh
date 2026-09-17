@@ -51,6 +51,85 @@ if ! cat > "$STDIN_FILE"; then
     exit 0
 fi
 
+if [ -n "$PYTHON" ]; then
+    CANONICAL_HOOK=$("$PYTHON" - "$STDIN_FILE" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        value = json.load(stream).get("hook_event_name", "")
+    if isinstance(value, str):
+        print(value)
+except Exception:
+    pass
+PY
+)
+    [ -n "$CANONICAL_HOOK" ] && HOOK="$CANONICAL_HOOK"
+fi
+
+RAW_TMP="${RAW_LOG}.tmp.$$"
+if cp "$STDIN_FILE" "$RAW_TMP" 2>/dev/null; then
+    chmod 600 "$RAW_TMP" 2>/dev/null || true
+    mv -f "$RAW_TMP" "$RAW_LOG" 2>/dev/null || true
+fi
+
+if [ -n "$PYTHON" ]; then
+    SUBAGENT_SKIP=$("$PYTHON" - "$STDIN_FILE" 2>/dev/null <<'PY'
+import json
+import os
+import re
+import sys
+
+SUBAGENT_PATH_RE = re.compile(
+    r"/\.claude/projects/[^/]+/[^/]+/subagents/agent-[^/]+\.jsonl$"
+)
+
+def _sidechain_tip(path):
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            end = fh.tell()
+            step = 4096
+            buf = b""
+            while end > 0 and buf.count(b"\n") < 2:
+                chunk = min(step, end)
+                end -= chunk
+                fh.seek(end)
+                buf = fh.read(chunk) + buf
+        line = buf.decode("utf-8", errors="replace").splitlines()[-1] if buf else ""
+        if not line.strip():
+            return False
+        return bool(json.loads(line).get("isSidechain"))
+    except Exception:
+        return False
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        payload = {}
+except Exception:
+    payload = {}
+
+hook_name = str(payload.get("hook_event_name") or "")
+transcript = str(payload.get("transcript_path") or "")
+skip = (
+    hook_name == "SubagentStop"
+    or bool(SUBAGENT_PATH_RE.search(transcript))
+    or _sidechain_tip(transcript)
+)
+print("1" if skip else "0")
+PY
+)
+    if [ "$SUBAGENT_SKIP" = "1" ]; then
+        printf 'skipped: sub-agent event (hook=%s)\n' "$HOOK" > "$HOOK_LOG"
+        exit 0
+    fi
+fi
+
 if [ -z "$PYTHON" ] || [ -z "$QUEUE" ] || [ ! -f "$QUEUE" ]; then
     printf 'notification backend unavailable: python=%s queue=%s\n' \
         "${PYTHON:-missing}" "$QUEUE" > "$HOOK_LOG"

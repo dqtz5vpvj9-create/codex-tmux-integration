@@ -116,3 +116,123 @@ def test_private_local_config_supplies_backend(tmp_path):
     log = (tmp_path / "cache/codex-tmux-integration/codex_hook.log").read_text()
     args = json.loads(log)
     assert args[args.index("--client") + 1] == "codex"
+
+
+def test_claude_wrapper_uses_canonical_hook_name(tmp_path):
+    queue = mock_queue(tmp_path)
+    result = subprocess.run(
+        [str(CLAUDE), "stop"],
+        input=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=wrapper_env(tmp_path, queue),
+        check=False,
+    )
+    assert result.returncode == 0
+    log = (tmp_path / "cache/codex-tmux-integration/claude_hook.log").read_text()
+    args = json.loads(log)
+    assert args[args.index("--hook") + 1] == "Stop"
+    raw = tmp_path / "cache/codex-tmux-integration/claude_hook_raw_stdin.json"
+    assert json.loads(raw.read_text())["session_id"] == "s1"
+
+
+def test_claude_wrapper_skips_subagent_stop_event(tmp_path):
+    queue = mock_queue(tmp_path)
+    result = subprocess.run(
+        [str(CLAUDE), "SubagentStop"],
+        input=json.dumps(
+            {"hook_event_name": "SubagentStop", "session_id": "s1"}
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=wrapper_env(tmp_path, queue),
+        check=False,
+    )
+    assert result.returncode == 0
+    log = (tmp_path / "cache/codex-tmux-integration/claude_hook.log").read_text()
+    assert "skipped: sub-agent event" in log
+
+
+def test_claude_wrapper_skips_subagent_transcript_path(tmp_path):
+    queue = mock_queue(tmp_path)
+    proj = tmp_path / ".claude/projects/-fake-project/parent-session/subagents"
+    proj.mkdir(parents=True)
+    transcript = proj / "agent-abc123.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "isSidechain": True}) + "\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "hook_event_name": "Stop",
+        "session_id": "s1",
+        "transcript_path": str(transcript),
+    }
+    result = subprocess.run(
+        [str(CLAUDE), "stop"],
+        input=json.dumps(payload),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=wrapper_env(tmp_path, queue),
+        check=False,
+    )
+    assert result.returncode == 0
+    log = (tmp_path / "cache/codex-tmux-integration/claude_hook.log").read_text()
+    assert "skipped: sub-agent event" in log
+
+
+def test_claude_wrapper_skips_sidechain_transcript_tip(tmp_path):
+    queue = mock_queue(tmp_path)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "isSidechain": False}) + "\n"
+        + json.dumps({"type": "assistant", "isSidechain": True}) + "\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "hook_event_name": "Stop",
+        "session_id": "s1",
+        "transcript_path": str(transcript),
+    }
+    result = subprocess.run(
+        [str(CLAUDE), "stop"],
+        input=json.dumps(payload),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=wrapper_env(tmp_path, queue),
+        check=False,
+    )
+    assert result.returncode == 0
+    log = (tmp_path / "cache/codex-tmux-integration/claude_hook.log").read_text()
+    assert "skipped: sub-agent event" in log
+
+
+def test_claude_wrapper_forwards_main_agent_stop(tmp_path):
+    queue = mock_queue(tmp_path)
+    transcript = tmp_path / "main-transcript.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "isSidechain": False}) + "\n"
+        + json.dumps({"type": "assistant", "isSidechain": False}) + "\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "hook_event_name": "Stop",
+        "session_id": "s1",
+        "transcript_path": str(transcript),
+    }
+    result = subprocess.run(
+        [str(CLAUDE), "stop"],
+        input=json.dumps(payload),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=wrapper_env(tmp_path, queue),
+        check=False,
+    )
+    assert result.returncode == 0
+    log = (tmp_path / "cache/codex-tmux-integration/claude_hook.log").read_text()
+    args = json.loads(log)
+    assert args[args.index("--hook") + 1] == "Stop"

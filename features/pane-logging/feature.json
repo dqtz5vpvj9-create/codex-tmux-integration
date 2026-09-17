@@ -1,6 +1,6 @@
 {
   "name": "pane-logging",
-  "description": "Capture bounded per-pane logs and browse them across tmux servers.",
+  "description": "Capture per-pane logs with lifecycle garbage collection and browse them across tmux servers.",
   "dependencies": [],
   "binaries": [
     {"source": "bin/tmux-autolog", "name": "tmux-autolog"},

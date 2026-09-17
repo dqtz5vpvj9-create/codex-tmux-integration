@@ -7,8 +7,18 @@ import argparse
 import fcntl
 import os
 import select
+import sys
 import time
 from pathlib import Path
+
+BIN_ROOT = Path(__file__).resolve().parent
+if str(BIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(BIN_ROOT))
+
+from pane_log_retention import (  # noqa: E402
+    log_root_for_path,
+    retention_lock,
+)
 
 DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_BACKUPS = 3
@@ -39,30 +49,32 @@ def rotate(path: Path, backups: int) -> None:
 def _write_locked(path: Path, data: bytes, max_bytes: int, backups: int) -> None:
     if not data:
         return
-    lock_path = path.with_name(f".{path.name}.lock")
-    with lock_path.open("a+b") as lock:
-        os.chmod(lock_path, 0o600)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            offset = 0
-            while offset < len(data):
-                try:
-                    size = path.stat().st_size
-                except OSError:
-                    size = 0
-                if size >= max_bytes:
-                    rotate(path, backups)
-                    size = 0
-                writable = max_bytes - size
-                part = data[offset : offset + writable]
-                with path.open("ab", buffering=0) as stream:
-                    os.chmod(path, 0o600)
-                    stream.write(part)
-                offset += len(part)
-                if offset < len(data):
-                    rotate(path, backups)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    root = log_root_for_path(path)
+    with retention_lock(root):
+        lock_path = path.with_name(f".{path.name}.lock")
+        with lock_path.open("a+b") as lock:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                offset = 0
+                while offset < len(data):
+                    try:
+                        size = path.stat().st_size
+                    except OSError:
+                        size = 0
+                    if size >= max_bytes:
+                        rotate(path, backups)
+                        size = 0
+                    writable = max_bytes - size
+                    part = data[offset : offset + writable]
+                    with path.open("ab", buffering=0) as stream:
+                        os.chmod(path, 0o600)
+                        stream.write(part)
+                    offset += len(part)
+                    if offset < len(data):
+                        rotate(path, backups)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _prepare(path: Path) -> bool:
@@ -149,6 +161,8 @@ def stream_live(
             pid_file.unlink(missing_ok=True)
         if ready is not None:
             ready.unlink(missing_ok=True)
+        if release is not None:
+            release.unlink(missing_ok=True)
     return 0
 
 

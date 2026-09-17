@@ -20,7 +20,23 @@ RUNTIME_ROOT = REPO_ROOT / "shared" / "tmux-runtime"
 if str(RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNTIME_ROOT))
 
-from tmux_runtime import register_socket, server_pid, socket_from_tmux_env  # noqa: E402
+BIN_ROOT = Path(__file__).resolve().parent
+if str(BIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(BIN_ROOT))
+
+from pane_log_retention import (  # noqa: E402
+    iter_log_files,
+    log_group,
+    max_total_bytes,
+    prune as prune_log_files,
+    total_log_bytes,
+)
+from tmux_runtime import (  # noqa: E402
+    live_sockets,
+    register_socket,
+    server_pid,
+    socket_from_tmux_env,
+)
 
 TMUX_TIMEOUT_SECONDS = 1.0
 MARKER_OPTION = "@codex_tmux_pipe"
@@ -49,6 +65,12 @@ def sink_path() -> Path:
         return Path(configured).expanduser()
     found = shutil_which("tmux-log-sink")
     return Path(found) if found else Path.home() / ".local/bin/tmux-log-sink"
+
+
+def sink_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["TMUX_PANE_LOGDIR"] = str(LOGDIR)
+    return environment
 
 
 def shutil_which(command: str) -> str | None:
@@ -182,6 +204,7 @@ def _write_snapshot(socket: str, pane: str, window: str, logfile: Path, sink: Pa
             input=payload,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=sink_environment(),
             check=False,
         )
     except OSError:
@@ -216,6 +239,7 @@ def enable_on(socket: str, pane: str) -> bool:
     words = [
         "env",
         "CODEX_TMUX_PIPE=pane-logging",
+        f"TMUX_PANE_LOGDIR={LOGDIR}",
         str(sink),
         "--live",
         "--ready",
@@ -257,6 +281,62 @@ def list_panes(socket: str) -> list[str]:
     ]
 
 
+def active_log_records(sockets: list[str] | None = None) -> list[dict[str, Any]]:
+    """Return active managed log groups and the panes that own them."""
+
+    candidates = set(live_sockets())
+    if sockets:
+        candidates.update(sockets)
+    groups: dict[Path, tuple[int, float]] = {}
+    for path in iter_log_files(LOGDIR):
+        group = log_group(path).resolve(strict=False)
+        try:
+            stat_result = path.stat()
+        except OSError:
+            continue
+        size, latest = groups.get(group, (0, 0.0))
+        groups[group] = (
+            size + stat_result.st_size,
+            max(latest, stat_result.st_mtime),
+        )
+
+    active: list[dict[str, Any]] = []
+    for socket in sorted(candidates):
+        pid = server_pid(socket)
+        if pid <= 0:
+            continue
+        for pane in list_panes(socket):
+            owned = marker(socket, pane)
+            if not owned:
+                continue
+            logfile = str(owned.get("logfile") or "")
+            pid_file = Path(str(owned.get("pid_file") or ""))
+            if not logfile or not str(owned.get("pid_file") or ""):
+                continue
+            try:
+                sink_pid = int(pid_file.read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                continue
+            if _sink_process_matches(sink_pid, logfile):
+                path = Path(logfile).expanduser()
+                size, latest = groups.get(
+                    log_group(path).resolve(strict=False),
+                    (0, 0.0),
+                )
+                active.append(
+                    {
+                        "socket": socket,
+                        "pane": pane,
+                        "logfile": path,
+                        "size": size,
+                        "latest": latest,
+                    }
+                )
+    return active
+
+
+def active_log_paths(sockets: list[str] | None = None) -> set[Path]:
+    return {record["logfile"] for record in active_log_records(sockets)}
 
 
 def _find_sink_pid(logfile: str) -> int:
@@ -314,11 +394,45 @@ def migrate(socket: str) -> int:
 
 
 def sweep(socket: str) -> int:
-    return sum(enable_on(socket, pane) for pane in list_panes(socket))
+    enabled = sum(enable_on(socket, pane) for pane in list_panes(socket))
+    prune_logs(socket)
+    return enabled
 
 
 def cleanup(socket: str) -> int:
-    return sum(close_owned_pipe(socket, pane) for pane in list_panes(socket))
+    closed = sum(close_owned_pipe(socket, pane) for pane in list_panes(socket))
+    prune_logs(socket)
+    return closed
+
+
+def prune_logs(socket: str | None = None) -> int:
+    sockets = [socket] if socket else None
+    removed = prune_log_files(
+        LOGDIR,
+        protected=active_log_paths(sockets),
+        collect_unprotected=True,
+    )
+    active = active_log_records(sockets)
+    total = total_log_bytes(LOGDIR)
+    limit = max_total_bytes()
+    evicted = False
+    for record in sorted(
+        (record for record in active if int(record["size"]) > 0),
+        key=lambda item: (item["latest"], str(item["logfile"])),
+    ):
+        if total <= limit:
+            break
+        if close_owned_pipe(record["socket"], record["pane"]):
+            evicted = True
+            total = max(0, total - int(record["size"]))
+
+    if evicted:
+        removed += prune_log_files(
+            LOGDIR,
+            protected=active_log_paths(sockets),
+            collect_unprotected=True,
+        )
+    return removed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -330,23 +444,29 @@ def build_parser() -> argparse.ArgumentParser:
     pane.add_argument("pane_id")
     subparsers.add_parser("cleanup")
     subparsers.add_parser("migrate")
+    subparsers.add_parser("prune")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    operation = args.operation or "sweep"
+    if operation == "prune":
+        prune_logs()
+        return 0
     socket = args.socket or socket_from_tmux_env()
     if not socket:
         return 0
-    operation = args.operation or "sweep"
     if operation == "sweep":
         sweep(socket)
     elif operation == "pane":
         enable_on(socket, args.pane_id)
+        prune_logs(socket)
     elif operation == "cleanup":
         cleanup(socket)
     else:
         migrate(socket)
+        prune_logs(socket)
     return 0
 
 

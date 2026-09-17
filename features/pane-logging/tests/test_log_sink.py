@@ -9,6 +9,7 @@ SINK = Path(__file__).resolve().parents[1] / "bin" / "tmux-log-sink"
 
 def run_sink(path, payload, *options, **env_values):
     env = os.environ.copy()
+    env.pop("TMUX_PANE_LOGDIR", None)
     env.update(env_values)
     return subprocess.run(
         [str(SINK), *options, str(path)],
@@ -17,6 +18,14 @@ def run_sink(path, payload, *options, **env_values):
         stderr=subprocess.PIPE,
         env=env,
         check=False,
+    )
+
+
+def log_bytes(root):
+    return sum(
+        path.stat().st_size
+        for path in root.rglob("*")
+        if path.is_file() and ".log" in path.name and not path.name.endswith(".lock")
     )
 
 
@@ -96,3 +105,23 @@ def test_live_data_is_buffered_until_snapshot_release(tmp_path):
     process.stdin.close()
     assert process.wait(timeout=2) == 0
     assert output.read_bytes() == b"snapshot\nlive\n"
+    assert not release.exists()
+
+
+def test_sink_does_not_collect_another_pane_while_writing(tmp_path):
+    old_root = tmp_path / "old-server"
+    old_root.mkdir()
+    old_log = old_root / "1.log"
+    old_log.write_bytes(b"old\n")
+
+    current = tmp_path / "new-server" / "2.log"
+    result = run_sink(
+        current,
+        b"new\n",
+        TMUX_PANE_LOGDIR=str(tmp_path),
+        TMUX_PANE_LOG_MAX_BYTES="16",
+    )
+
+    assert result.returncode == 0
+    assert current.read_bytes() == b"new\n"
+    assert old_log.exists()

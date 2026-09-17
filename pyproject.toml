@@ -1,5 +1,7 @@
 [tool.pytest.ini_options]
-addopts = "-ra"
+# picker-rs/tests is a standalone script that drives the built Rust binary on a
+# pty; it is run by hand (see its README), not collected.
+addopts = "-ra --ignore=features/ssh-autoattach/picker-rs"
 testpaths = [
   "features",
   "shared",

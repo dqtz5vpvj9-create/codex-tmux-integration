@@ -28,6 +28,7 @@ TMUX_TIMEOUT_SECONDS = 1.0
 CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
 STATE_ROOT = CACHE_HOME / "codex-tmux-integration" / "window-attention"
 DEFAULT_STYLE = "fg=black,bg=#d7af00,bold"
+HOOK_MANAGER = Path.home() / ".local" / "bin" / "codex-tmux-hook-manager"
 
 
 def clean(value: Any) -> str:
@@ -259,6 +260,29 @@ def cleanup_server(socket: str) -> int:
     return restored
 
 
+def ensure_clear_hooks(socket: str) -> bool:
+    if not HOOK_MANAGER.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HOOK_MANAGER),
+                "ensure",
+                "window-attention",
+                "--socket",
+                socket,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def read_payload() -> dict[str, Any]:
     try:
         raw = sys.stdin.read()
@@ -277,8 +301,10 @@ def mark_from_hook(payload: dict[str, Any]) -> bool:
     if not socket or not pane:
         return False
     window = window_for_pane(socket, pane)
+    if not window or not ensure_clear_hooks(socket):
+        return False
     style = os.environ.get("AGENT_TMUX_NOTIFY_STYLE", DEFAULT_STYLE)
-    return mark_window(socket, window, style) if window else False
+    return mark_window(socket, window, style)
 
 
 def build_parser() -> argparse.ArgumentParser:

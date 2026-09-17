@@ -150,3 +150,52 @@ def test_ambiguous_hook_target_is_ignored(monkeypatch):
         lambda payload, env: {"ambiguous": True, "socket": "", "pane": ""},
     )
     assert not notify.mark_from_hook({"session_id": "x"})
+
+
+def test_hook_repairs_clear_hooks_before_marking(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        notify,
+        "resolve_hook_target_details",
+        lambda payload, env: {
+            "ambiguous": False,
+            "socket": "/tmp/server",
+            "pane": "%1",
+        },
+    )
+    monkeypatch.setattr(notify, "window_for_pane", lambda socket, pane: "@1")
+    monkeypatch.setattr(
+        notify,
+        "ensure_clear_hooks",
+        lambda socket: calls.append(("ensure", socket)) or True,
+    )
+    monkeypatch.setattr(
+        notify,
+        "mark_window",
+        lambda socket, window, style: calls.append(("mark", socket, window, style)) or True,
+    )
+    assert notify.mark_from_hook({"hook_event_name": "Stop"})
+    assert calls == [
+        ("ensure", "/tmp/server"),
+        ("mark", "/tmp/server", "@1", notify.DEFAULT_STYLE),
+    ]
+
+
+def test_hook_fails_closed_when_clear_hooks_cannot_be_repaired(monkeypatch):
+    monkeypatch.setattr(
+        notify,
+        "resolve_hook_target_details",
+        lambda payload, env: {
+            "ambiguous": False,
+            "socket": "/tmp/server",
+            "pane": "%1",
+        },
+    )
+    monkeypatch.setattr(notify, "window_for_pane", lambda socket, pane: "@1")
+    monkeypatch.setattr(notify, "ensure_clear_hooks", lambda socket: False)
+    monkeypatch.setattr(
+        notify,
+        "mark_window",
+        lambda *args: (_ for _ in ()).throw(AssertionError("unexpected highlight")),
+    )
+    assert not notify.mark_from_hook({"hook_event_name": "Stop"})

@@ -24,3 +24,9 @@ a server restarted at the same socket does not append to a previous lifetime.
 Pane-exit and session-close hooks trigger retention cleanup, while `tlog`
 discovers both default sockets and custom sockets registered by the tmux
 configuration.
+
+Set the global option `@pane-logging-exclude-command` to a regular expression to
+keep panes out of logging by the command they were started with, for example
+`set -g @pane-logging-exclude-command 'agent-tmux-sidebar'`. It is meant for
+panes that only draw a user interface: their output is repainting, which would
+spend a sink process each and the log budget of the panes that matter.

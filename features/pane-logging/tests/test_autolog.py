@@ -184,3 +184,26 @@ def test_prune_evicts_oldest_active_group_when_live_budget_is_full(monkeypatch, 
     ]
     assert not old_log.exists()
     assert new_log.exists()
+
+
+def test_pane_whose_start_command_is_excluded_is_not_logged(monkeypatch):
+    monkeypatch.setattr(autolog, "server_pid", lambda socket: 1)
+    monkeypatch.setattr(autolog, "marker", lambda socket, pane: None)
+    monkeypatch.setattr(
+        autolog,
+        "pane_info",
+        lambda socket, pane: {"pane": pane, "pipe": False, "window": "w",
+                              "command": "'/home/u/bin/agent-tmux-sidebar' --inside @3 34 44"},
+    )
+    options = {autolog.EXCLUDE_OPTION: "agent-tmux-sidebar"}
+    monkeypatch.setattr(autolog, "tmux", lambda socket, *args: options.get(args[-1], ""))
+    monkeypatch.setattr(
+        autolog, "sink_path", lambda: (_ for _ in ()).throw(AssertionError("must not start a sink"))
+    )
+    assert not autolog.enable_on("/tmp/server", "%7")
+
+
+def test_no_exclusion_pattern_excludes_nothing(monkeypatch):
+    monkeypatch.setattr(autolog, "tmux", lambda socket, *args: "")
+    assert not autolog.excluded("/tmp/server", {"command": "agent-tmux-sidebar"})
+

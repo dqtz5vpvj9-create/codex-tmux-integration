@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -40,6 +41,10 @@ from tmux_runtime import (  # noqa: E402
 
 TMUX_TIMEOUT_SECONDS = 1.0
 MARKER_OPTION = "@codex_tmux_pipe"
+# A regular expression; a pane whose start command matches it is never logged.
+# It is for panes that only draw a user interface, such as a sidebar: their
+# output is repainting, and it would eat the log budget of the panes that matter.
+EXCLUDE_OPTION = "@pane-logging-exclude-command"
 LOGDIR = Path(os.environ.get("TMUX_PANE_LOGDIR", Path.home() / ".cache/tmux-pane-logs"))
 
 
@@ -107,12 +112,17 @@ def pane_info(socket: str, pane: str) -> dict[str, Any] | None:
         "-p",
         "-t",
         pane,
-        "#{pane_id}\t#{pane_pipe}\t#{window_name}",
+        "#{pane_id}\t#{pane_pipe}\t#{window_name}\t#{pane_start_command}",
     )
-    parts = raw.split("\t")
-    if len(parts) != 3 or parts[0] != pane:
+    parts = raw.split("\t", 3)
+    if len(parts) != 4 or parts[0] != pane:
         return None
-    return {"pane": pane, "pipe": parts[1] == "1", "window": parts[2]}
+    return {"pane": pane, "pipe": parts[1] == "1", "window": parts[2], "command": parts[3]}
+
+
+def excluded(socket: str, info: dict[str, Any]) -> bool:
+    pattern = tmux(socket, "show-options", "-gqv", EXCLUDE_OPTION)
+    return bool(pattern) and re.search(pattern, info["command"]) is not None
 
 
 def marker(socket: str, pane: str) -> dict[str, Any] | None:
@@ -219,6 +229,8 @@ def enable_on(socket: str, pane: str) -> bool:
     owned = marker(socket, pane)
     if info["pipe"]:
         return owned is not None
+    if excluded(socket, info):
+        return False
     if owned is not None:
         unset_marker(socket, pane)
 

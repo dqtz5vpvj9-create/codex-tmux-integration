@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import dataclasses
 import errno
 import json
 import os
@@ -15,9 +16,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
-from .capture import capture_helper
 from .model import (
     CAPTURE_SCHEMA,
     DEFAULT_CONTROL_SOCKET,
@@ -25,19 +25,22 @@ from .model import (
     SS_REFRESH_SECONDS,
     ListenerError,
     discover,
+    process_start_ticks,
     utc_now,
 )
 from .protocol import ProtocolState, ThreadNameResolver, connection_event
 
 
-TRUSTED_HELPER = Path(
-    "/usr/libexec/codex-session-listener/current/codex_session_listener.py"
-)
+TRUSTED_HELPER = Path("/usr/libexec/codex-session-listener/current/codex-session-capture")
 DEFAULT_TITLE_SYNC = Path.home() / ".local/bin/codex-tmux-title-sync"
 
 
 class TitleSyncConsumer:
-    """Trigger the non-resident tmux applier after metadata changes."""
+    """Trigger the non-resident tmux applier after metadata changes.
+
+    A failed run is reported and left at that: the next change runs it again,
+    whereas ending the listener would empty the registry every consumer reads.
+    """
 
     def __init__(self, command: Path, timeout: float = 3.0):
         self.command = command
@@ -59,10 +62,11 @@ class TitleSyncConsumer:
                 timeout=self.timeout,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ListenerError(f"tmux title sync failed: {exc}") from exc
+            print(f"codex-session-listener: tmux title sync failed: {exc}", file=sys.stderr)
+            return
         if completed.returncode != 0:
             detail = completed.stderr.strip() or f"exit {completed.returncode}"
-            raise ListenerError(f"tmux title sync failed: {detail}")
+            print(f"codex-session-listener: tmux title sync failed: {detail}", file=sys.stderr)
 
 
 class RegistryOutput:
@@ -78,6 +82,8 @@ class RegistryOutput:
         self.state_file = state_file
         self.on_change = on_change
         self.connections: dict[str, dict[str, Any]] = {}
+        self.processes: dict[str, dict[str, Any]] = {}
+        self.remembered = self._load_remembered()
         if state_file is not None:
             self._persist()
 
@@ -97,6 +103,7 @@ class RegistryOutput:
 
     def reset(self) -> None:
         self.connections.clear()
+        self.processes.clear()
         if self.state_file is not None:
             self._persist()
 
@@ -105,6 +112,16 @@ class RegistryOutput:
             return
         connection_id = event.get("connection_id")
         kind = event.get("event")
+        process = event.get("process")
+        if kind in {"process.started", "process.exited"} and isinstance(process, dict):
+            if kind == "process.started":
+                self.processes[str(process.get("pid"))] = process
+            else:
+                self.processes.pop(str(process.get("pid")), None)
+            if self.state_file is not None:
+                # Titles come from connections; the applier finds processes itself.
+                self._persist(notify=False)
+            return
         if not isinstance(connection_id, str) or not isinstance(kind, str):
             return
         if kind == "connection.closed":
@@ -130,9 +147,58 @@ class RegistryOutput:
         if self.state_file is not None:
             self._persist()
 
-    def _persist(self) -> None:
+    @property
+    def bindings_file(self) -> Path | None:
+        if self.state_file is None:
+            return None
+        return self.state_file.with_name(self.state_file.name + ".bindings")
+
+    def _load_remembered(self) -> dict[str, str]:
+        """Thread ids the previous listener had bound, by connection key.
+
+        The registry is cleared whenever the listener stops, and a connection
+        that is idle afterwards sends nothing a new listener could learn its
+        thread from. A connection key covers both process generations and both
+        socket inodes, so a remembered id can only reattach to the very
+        connection it was observed on.
+        """
+
+        if self.bindings_file is None:
+            return {}
+        try:
+            saved = json.loads(self.bindings_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        bindings = saved.get("bindings") if isinstance(saved, dict) else None
+        if not isinstance(bindings, dict):
+            return {}
+        return {key: value for key, value in bindings.items() if isinstance(value, str)}
+
+    def _persist_bindings(self) -> None:
+        assert self.bindings_file is not None
+        bindings = {
+            key: connection["thread"]["id"]
+            for key, connection in self.connections.items()
+            if isinstance((connection.get("thread") or {}).get("id"), str)
+        }
+        temporary = self.bindings_file.with_name(self.bindings_file.name + ".tmp")
+        temporary.write_text(
+            json.dumps({"schema": "codex.session-bindings.v1", "bindings": bindings}),
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.bindings_file)
+        # What the next listen() in this process starts from, should the helper
+        # ask for a restart; the copy read at startup is hours out of date by then.
+        self.remembered = bindings
+
+    def _persist(self, notify: bool = True) -> None:
         assert self.state_file is not None
         self.state_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # An empty registry means the listener is starting or stopping, which is
+        # exactly when the remembered bindings must survive.
+        if self.connections:
+            self._persist_bindings()
         descriptor, temporary = tempfile.mkstemp(
             prefix=f".{self.state_file.name}.", dir=self.state_file.parent
         )
@@ -143,6 +209,7 @@ class RegistryOutput:
                         "schema": "codex.session-registry.v1",
                         "observed_at": utc_now(),
                         "connections": self.connections,
+                        "processes": self.processes,
                     },
                     stream,
                     ensure_ascii=False,
@@ -153,7 +220,7 @@ class RegistryOutput:
                 os.fsync(stream.fileno())
             os.chmod(temporary, 0o600)
             os.replace(temporary, self.state_file)
-            if self.on_change is not None:
+            if notify and self.on_change is not None:
                 self.on_change(self.state_file)
         finally:
             try:
@@ -167,11 +234,21 @@ def encode_event(stream: TextIO, event: dict[str, Any]) -> None:
     stream.flush()
 
 
-def opening_events(state: ProtocolState) -> list[dict[str, Any]]:
-    """Publish an explicit ``resume UUID`` hint even when the thread has no name."""
+def opening_events(
+    state: ProtocolState, remembered: str | None = None
+) -> list[dict[str, Any]]:
+    """Publish the thread a new listener starts a connection on, named or not.
+
+    ``remembered`` is the thread a previous listener had bound to this same
+    connection. The connection key covers the process generation and its
+    ``resume UUID`` argument, so whatever was remembered was seen after that
+    argument was given, and wins over it: the user may have used /resume since.
+    """
 
     events = [connection_event("connection.opened", state.connection)]
-    if state.connection.thread_hint is not None:
+    if remembered is not None:
+        events.append(state._event("thread.bound", remembered, None, "registry:remembered"))
+    elif state.connection.thread_hint is not None:
         events.append(
             state._event(
                 "thread.bound",
@@ -183,18 +260,36 @@ def opening_events(state: ProtocolState) -> list[dict[str, Any]]:
     return events
 
 
+def process_event(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Publish an agent process the helper saw start or exit.
+
+    The registry lists the agents that started while the listener ran; an exit
+    is published even for an older one, so a consumer watching the file learns
+    of it without polling.
+    """
+
+    pid = record.get("pid")
+    name = {"exec": "process.started", "exit": "process.exited"}.get(record.get("event"))
+    if not isinstance(pid, int) or name is None:
+        return None
+    return {
+        "schema": SCHEMA,
+        "observed_at": utc_now(),
+        "event": name,
+        "process": {
+            "pid": pid,
+            "start_ticks": process_start_ticks(pid),
+            "comm": record.get("comm"),
+        },
+    }
+
+
 def helper_command(
-    helper_script: Path,
+    helper: Path,
     control_socket: Path,
 ) -> list[str]:
-    helper_script = validate_privileged_helper(helper_script)
-    arguments = [
-        str(helper_script),
-        "--capture-helper",
-        "--control-socket",
-        str(control_socket),
-    ]
-    command = ["/usr/bin/python3", "-I", "-E", "-s", *arguments]
+    helper = validate_privileged_helper(helper)
+    command = [str(helper), "--control-socket", str(control_socket)]
     if os.geteuid() == 0:
         return command
     sudo = Path("/usr/bin/sudo")
@@ -203,12 +298,12 @@ def helper_command(
     return [str(sudo), "-n", "--", *command]
 
 
-def validate_privileged_helper(helper_script: Path) -> Path:
+def validate_privileged_helper(helper: Path) -> Path:
     """Require an immutable, root-owned helper bundle before using sudo."""
 
-    requested = helper_script.absolute()
+    requested = helper.absolute()
     try:
-        resolved = helper_script.resolve(strict=True)
+        resolved = helper.resolve(strict=True)
     except OSError as exc:
         raise ListenerError(
             "trusted capture helper is not installed; run "
@@ -217,11 +312,6 @@ def validate_privileged_helper(helper_script: Path) -> Path:
     bundle = resolved.parent
     required = [
         resolved,
-        bundle / "session_listener" / "__init__.py",
-        bundle / "session_listener" / "model.py",
-        bundle / "session_listener" / "protocol.py",
-        bundle / "session_listener" / "capture.py",
-        bundle / "session_listener" / "cli.py",
         bundle / "bpf" / "codex_session_capture.bpf.o",
     ]
     ancestors: list[Path] = []
@@ -232,7 +322,6 @@ def validate_privileged_helper(helper_script: Path) -> Path:
     paths = [
         requested,
         *required,
-        bundle / "session_listener",
         bundle / "bpf",
         *ancestors,
     ]
@@ -299,16 +388,21 @@ def diagnose(control_socket: Path, output: TextIO) -> int:
 def listen(
     control_socket: Path,
     output: TextIO,
-    helper_script: Path = TRUSTED_HELPER,
+    helper: Path = TRUSTED_HELPER,
+    remembered: Mapping[str, str] | None = None,
 ) -> int:
-    command = helper_command(helper_script, control_socket)
+    command = helper_command(helper, control_socket)
     initial = discover(control_socket)
+    remembered = remembered or {}
     states = {
-        fd: ProtocolState(connection, thread_id=connection.thread_hint)
+        fd: ProtocolState(
+            connection,
+            thread_id=remembered.get(connection.key) or connection.thread_hint,
+        )
         for fd, connection in initial.connections.items()
     }
     for state in states.values():
-        for event in opening_events(state):
+        for event in opening_events(state, remembered.get(state.connection.key)):
             encode_event(output, event)
 
     helper = subprocess.Popen(
@@ -358,10 +452,24 @@ def listen(
             )
             states.pop(fd, None)
         for fd in sorted(added | replaced):
+            # A connection the first discovery missed, or saw without its tmux
+            # pane, can still be one a previous listener had bound.
             connection = current.connections[fd]
-            state = ProtocolState(connection, thread_id=connection.thread_hint)
+            generation = (connection.client_pid, connection.client_start_ticks)
+            if connection.thread_hint is not None and any(
+                (other.connection.client_pid, other.connection.client_start_ticks) == generation
+                for other in states.values()
+            ):
+                # The resume argument names the thread the TUI started on, which
+                # its first connection carries. A later one, such as the one its
+                # /resume list opens, is on no thread at all.
+                connection = dataclasses.replace(connection, thread_hint=None)
+            state = ProtocolState(
+                connection,
+                thread_id=remembered.get(connection.key) or connection.thread_hint,
+            )
             states[fd] = state
-            for event in opening_events(state):
+            for event in opening_events(state, remembered.get(connection.key)):
                 encode_event(output, event)
         last_discovery = current
         return True
@@ -371,6 +479,11 @@ def listen(
             return True
         if record.get("kind") == "topology":
             return reconcile_topology()
+        if record.get("kind") == "process":
+            event = process_event(record)
+            if event is not None:
+                encode_event(output, event)
+            return True
         if record.get("kind") != "protocol":
             return True
         fd = record.get("fd")
@@ -384,6 +497,7 @@ def listen(
         message = record.get("message")
         if state is None or not isinstance(message, dict):
             return True
+        before = (state.thread_id, state.thread_name)
         for semantic_event in state.consume(direction, message):
             encode_event(output, semantic_event)
             thread = semantic_event.get("thread")
@@ -395,6 +509,10 @@ def listen(
                 and isinstance(thread_name, str)
             ):
                 known_names[thread_id] = thread_name
+        if state.thread_id == before[0] and before[1] is not None and state.thread_name is None:
+            # A confirmed rename dropped the name so that it is read back; the
+            # old one cached here must not stand in for that read.
+            known_names.pop(state.thread_id, None)
         return True
 
     def schedule_name_resolutions() -> None:
@@ -557,9 +675,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="print one connection snapshot without loading BPF",
     )
-    parser.add_argument("--capture-helper", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
-        "--helper-script",
+        "--helper",
         type=Path,
         default=TRUSTED_HELPER,
         help=argparse.SUPPRESS,
@@ -571,8 +688,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     output: RegistryOutput | None = None
     try:
-        if args.capture_helper:
-            return capture_helper(args.control_socket)
         if args.diagnose:
             return diagnose(args.control_socket, sys.stdout)
 
@@ -594,7 +709,7 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             try:
                 result = listen(
-                    args.control_socket, output, args.helper_script
+                    args.control_socket, output, args.helper, output.remembered
                 )
             except ListenerError as exc:
                 message = str(exc)

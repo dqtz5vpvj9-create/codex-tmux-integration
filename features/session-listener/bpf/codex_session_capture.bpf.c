@@ -31,6 +31,8 @@ static void (*bpf_ringbuf_submit)(void *data, __u64 flags) =
     (void *)BPF_FUNC_ringbuf_submit;
 static void (*bpf_ringbuf_discard)(void *data, __u64 flags) =
     (void *)BPF_FUNC_ringbuf_discard;
+static long (*bpf_get_current_comm)(void *buf, __u32 size) =
+    (void *)BPF_FUNC_get_current_comm;
 
 struct trace_sys_enter {
     __u64 common;
@@ -343,6 +345,101 @@ SCALAR_IO(read, IO_READ, 0)
 SCALAR_IO(recvfrom, IO_RECVFROM, 0)
 VECTOR_IO(readv, IO_READV, 0)
 MESSAGE_IO(recvmsg, IO_RECVMSG, 0)
+
+/*
+ * Agent process lifecycle. A consumer learns that a Claude Code or Codex
+ * process started or exited without scanning /proc. Only the pid and comm of
+ * those two executables leave the kernel; every other exec and exit is dropped
+ * here.
+ */
+#define PROCESS_EXEC 1
+#define PROCESS_EXIT 2
+#define COMM_LEN 16
+
+struct process_event_t {
+    __u64 timestamp_ns;
+    __u32 pid;
+    __u8 kind;
+    char comm[COMM_LEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, __u8);
+} agent_pids SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 16);
+} process_events SEC(".maps");
+
+static __always_inline int is_agent_comm(const char *comm)
+{
+    if (comm[0] != 'c')
+        return 0;
+    if (comm[1] == 'l' && comm[2] == 'a' && comm[3] == 'u' && comm[4] == 'd' &&
+        comm[5] == 'e' && comm[6] == 0)
+        return 1;
+    return comm[1] == 'o' && comm[2] == 'd' && comm[3] == 'e' && comm[4] == 'x' &&
+           comm[5] == 0;
+}
+
+static __always_inline void emit_process_event(__u32 pid, __u8 kind, const char *comm)
+{
+    struct process_event_t *event =
+        bpf_ringbuf_reserve(&process_events, sizeof(*event), 0);
+    if (!event)
+        return;
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = pid;
+    event->kind = kind;
+    for (int index = 0; index < COMM_LEN; index++)
+        event->comm[index] = comm[index];
+    bpf_ringbuf_submit(event, 0);
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int on_process_exec(void *ctx)
+{
+    char comm[COMM_LEN] = {};
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u8 present = 1;
+
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (!is_agent_comm(comm)) {
+        /*
+         * A launcher script named after the agent runs under that name only
+         * until its interpreter takes over. From then on it is not an agent,
+         * and its eventual exit would carry the interpreter's name.
+         */
+        if (bpf_map_lookup_elem(&agent_pids, &pid)) {
+            bpf_map_delete_elem(&agent_pids, &pid);
+            emit_process_event(pid, PROCESS_EXIT, comm);
+        }
+        return 0;
+    }
+    bpf_map_update_elem(&agent_pids, &pid, &present, BPF_ANY);
+    emit_process_event(pid, PROCESS_EXEC, comm);
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int on_process_exit(void *ctx)
+{
+    char comm[COMM_LEN] = {};
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+
+    /* Every thread passes through here; only the process itself counts. */
+    if (pid != (__u32)id || !bpf_map_lookup_elem(&agent_pids, &pid))
+        return 0;
+    bpf_map_delete_elem(&agent_pids, &pid);
+    bpf_get_current_comm(comm, sizeof(comm));
+    emit_process_event(pid, PROCESS_EXIT, comm);
+    return 0;
+}
 
 /* Keep the generated section names visible to simple source audits. */
 #if 0

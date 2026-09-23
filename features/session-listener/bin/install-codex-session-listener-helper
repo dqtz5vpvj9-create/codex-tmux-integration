@@ -2,8 +2,9 @@
 """Install an immutable privileged capture bundle.
 
 The normal listener never asks root to execute code from the user-writable
-repository.  This explicit installation step builds the BPF object as the
-calling user, then copies a content-addressed Python/helper bundle as root.
+repository.  This explicit installation step builds the BPF object and the
+Rust capture helper as the calling user, then copies them into a
+content-addressed, root-owned bundle.
 """
 
 from __future__ import annotations
@@ -22,7 +23,11 @@ from pathlib import Path
 FEATURE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FEATURE_ROOT))
 
-from session_listener.capture import build_bpf_object  # noqa: E402
+from session_listener.capture import (  # noqa: E402
+    HELPER_NAME,
+    build_bpf_object,
+    build_capture_helper,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,18 +64,19 @@ def sudoers_argument(value: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    helper_path = build_capture_helper()
     temporary, object_path = build_bpf_object()
+    # The sources travel with the bundle so that what root runs can be audited.
     sources = {
-        "codex_session_listener.py": FEATURE_ROOT / "codex_session_listener.py",
-        "session_listener/__init__.py": FEATURE_ROOT / "session_listener/__init__.py",
-        "session_listener/model.py": FEATURE_ROOT / "session_listener/model.py",
-        "session_listener/protocol.py": FEATURE_ROOT / "session_listener/protocol.py",
-        "session_listener/capture.py": FEATURE_ROOT / "session_listener/capture.py",
-        "session_listener/cli.py": FEATURE_ROOT / "session_listener/cli.py",
+        HELPER_NAME: helper_path,
         "bpf/codex_session_capture.bpf.c": (
             FEATURE_ROOT / "bpf/codex_session_capture.bpf.c"
         ),
         "bpf/codex_session_capture.bpf.o": object_path,
+        **{
+            f"src/{source.name}": source
+            for source in sorted((FEATURE_ROOT / "helper-rs/src").glob("*.rs"))
+        },
     }
     digest = hashlib.sha256()
     for relative, source in sorted(sources.items()):
@@ -85,8 +91,8 @@ def main() -> int:
             prefix,
             prefix / "versions",
             destination,
-            destination / "session_listener",
             destination / "bpf",
+            destination / "src",
         ):
             run_root(
                 [
@@ -110,7 +116,7 @@ def main() -> int:
                     "-g",
                     "root",
                     "-m",
-                    "0644",
+                    "0755" if relative == HELPER_NAME else "0644",
                     str(source),
                     str(destination / relative),
                 ]
@@ -136,16 +142,11 @@ def main() -> int:
             account = pwd.getpwuid(os.getuid()).pw_name
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", account):
                 raise SystemExit(f"unsupported account name for sudoers: {account!r}")
-            helper = prefix / "current/codex_session_listener.py"
+            helper = prefix / "current" / HELPER_NAME
             command = " ".join(
                 sudoers_argument(str(item))
                 for item in (
-                    "/usr/bin/python3",
-                    "-I",
-                    "-E",
-                    "-s",
                     helper,
-                    "--capture-helper",
                     "--control-socket",
                     args.control_socket.resolve(strict=False),
                 )

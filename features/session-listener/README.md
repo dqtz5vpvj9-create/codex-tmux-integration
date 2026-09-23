@@ -14,6 +14,29 @@ The command writes newline-delimited JSON events describing only:
 It deliberately never emits user input, assistant output, tool data, approval
 contents, or raw app-server frames.
 
+## Agent processes
+
+The same helper traces `sched_process_exec` and `sched_process_exit`, filtered
+in the kernel to the `claude` and `codex` executables; nothing about any other
+process leaves it. The registry lists, under `processes`, every agent that
+started while the listener ran, and it is rewritten when any agent exits, so a
+consumer watching the file learns of both without scanning `/proc`. A Codex TUI
+that runs without the app-server opens no connection, and this is the only
+event its start produces.
+
+The section stays empty until the helper bundle that contains these tracepoints
+has been installed with `install-codex-session-listener-helper`.
+
+## Restarts
+
+The registry is cleared whenever the listener stops, and a connection that sits
+idle afterwards sends nothing a new listener could learn its thread from. The
+bound thread ids are therefore also kept in `sessions.json.bindings`, keyed by
+the connection key. That key covers both process generations and both socket
+inodes, so a remembered id can only reattach to the very connection it was
+observed on; its name is then read back through `thread/read` as usual. A
+`resume` argument still wins.
+
 When a captured binding contains an ID but no name, the unprivileged controller
 uses app-server's read-only `thread/read` method with `includeTurns: false`.
 That method neither resumes nor subscribes to the thread. The returned summary
@@ -41,13 +64,20 @@ root-owned helper bundle explicitly:
 install-codex-session-listener-helper
 ```
 
-The installer compiles BPF as the calling user, then copies a fixed bundle to
-`/usr/libexec/codex-session-listener`. The listener refuses helpers that are not
-root-owned, contain missing components, or are writable by group/other users.
-Root never executes Python or loads a BPF object from the user-writable source
-tree. It also validates and installs a `sudoers.d` rule restricted to that
-fixed helper, the current user, and the selected control-socket path; it does
-not grant a general Python or BPF command.
+The installer compiles the BPF object and the capture helper as the calling
+user, then copies a fixed bundle to `/usr/libexec/codex-session-listener`. The
+listener refuses helpers that are not root-owned, contain missing components,
+or are writable by group/other users. Root never executes anything, and never
+loads a BPF object, from the user-writable source tree. The installer also
+validates and installs a `sudoers.d` rule restricted to that fixed helper, the
+current user, and the selected control-socket path; it does not grant a general
+interpreter or BPF command.
+
+The helper is the Rust crate in `helper-rs`, so installing it needs `cargo` in
+addition to `clang` and the system's libbpf. The crate has no dependencies: it
+declares the few libc calls it uses, opens libbpf by its soname at run time,
+and builds with `--locked --offline`. Its sources are copied into the bundle
+next to the binary, so what root runs can be read where it is installed.
 
 Then run the listener:
 
@@ -60,6 +90,14 @@ configured app-server control socket. It strips each decoded JSON-RPC message
 inside the privileged helper and sends only session metadata through the
 private pipe. Raw byte segments never enter the public event process and are
 discarded immediately.
+
+`ss -p` reads the descriptor table of every process, which on a busy machine
+costs tens of milliseconds of CPU per call. The helper therefore checks every
+two seconds only whether the set of sockets bound to the control path in
+`/proc/net/unix` has changed, and runs the full verification when it has, when
+the last one failed or could not reach a tmux server, and every thirty seconds
+regardless. Between verifications every captured event is still checked against
+the verified socket inode and the client's process generation, as before.
 
 The fixed helper needs root only while loading and attaching BPF. When launched
 through `sudo`, it drops supplementary groups, GID, and UID back to the invoking
@@ -93,9 +131,18 @@ Every line is one `codex.session-listener.v1` object. Important events are:
 
 - `connection.opened` and `connection.closed`;
 - `thread.bound` after an authoritative start, resume, fork, turn request, or
-  active-thread notification;
+  active-thread notification. A connection that is already on a thread does
+  not move when it merely resumes another one: the Codex TUI also resumes a
+  thread just to show it (`/agent` opening a sub-agent, refreshing a snapshot
+  before replay), and only a real `/resume` goes on to unsubscribe the old
+  thread. So such a resume waits until the client unsubscribes some other
+  thread (source `thread/resume+unsubscribe`), and a turn on either thread
+  settles it. The switch happens on the unsubscribe request, since the TUI
+  does not wait on the answer either;
 - `thread.name.requested` for the client request;
-- `thread.name.updated` after the app-server confirms the new name.
+- `thread.name.updated` after the app-server confirms the new name. The
+  announcement carries it as `threadName`; a client that opted out of it still
+  gets the bare answer to its request, after which the name is read back.
 - `thread.name.resolved` after a read-only lookup fills an existing name.
 
 `connection_id` includes both process start times and file descriptors, so PID
@@ -119,7 +166,7 @@ resumed:
 
 ```bash
 codex-session-diagnose
-codex-session-diagnose 019fecba-66bc-7be1-9de7-e56fc7b6a060
+codex-session-diagnose 019f0000-0000-7000-8000-000000000001
 ```
 
 With no argument it lists all threads currently loaded by app-server. Passing
@@ -133,8 +180,21 @@ are never guessed to own the thread. Pass `--json` for structured output.
 
 By default the listener invokes `codex-tmux-title-sync` in one-shot registry
 mode after metadata changes. The applier preserves manual window names and
-exits immediately; it does not create a per-pane polling process. Use
+exits immediately; it does not create a per-pane polling process. A failed
+run is reported on stderr and retried with the next change; agent process
+events do not trigger it, since titles come from connections. Use
 `--no-title-sync` when only the general metadata registry is wanted.
+
+## End-to-end check
+
+`integration-tests/session_listener_e2e.sh` drives real Codex TUIs against a
+second listener: a sandbox `CODEX_HOME` with its own app-server, a private
+tmux server, and the installed capture helper through sudo. It covers a rename,
+`/new`, a `/resume` switch, the extra connection a `/resume` list opens, and a
+listener restart. The sandbox signs in with a made-up API key, so nothing
+reaches the model and the real ChatGPT tokens are never copied. It needs
+passwordless sudo and an installed helper, so CI only checks its syntax.
+`KEEP_SANDBOX=1` keeps the sandbox for a look after a failure.
 
 ## Boundaries
 

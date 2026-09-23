@@ -6,7 +6,6 @@ import base64
 import dataclasses
 import json
 import os
-import re
 import socket
 import struct
 from pathlib import Path
@@ -290,57 +289,6 @@ def decode_json_message(payload: bytes) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-_METHOD_RE = re.compile(rb'"method"\s*:\s*"([^"\\]+)"')
-_THREAD_RE = re.compile(rb'"(?:threadId|thread_id)"\s*:\s*"([\w-]{8,128})"')
-_THREAD_OBJECT_RE = re.compile(
-    rb'"thread"\s*:\s*\{[^{}]{0,512}?"id"\s*:\s*"([\w-]{8,128})"'
-)
-_NAME_RE = re.compile(rb'"name"\s*:\s*"((?:[^"\\]|\\.){0,512})"')
-_ID_RE = re.compile(rb'"id"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)')
-
-_SESSION_METHODS = {
-    "thread/start",
-    "thread/resume",
-    "thread/fork",
-    "thread/name/set",
-    "thread/unsubscribe",
-    "turn/start",
-    "turn/steer",
-    "thread/shellCommand",
-    "thread/name/updated",
-    "thread/started",
-    "thread/tokenUsage/updated",
-    "turn/started",
-}
-
-
-def websocket_payload_prefix(data: bytes, *, masked: bool) -> bytes | None:
-    if data.startswith((b"GET ", b"HTTP/1.1 ")) or len(data) < 2:
-        return None
-    first, second = data[0], data[1]
-    if first & 0x70 or (first & 0x0F) not in (0x1, 0x2):
-        return None
-    if bool(second & 0x80) != masked:
-        return None
-    length = second & 0x7F
-    offset = 2
-    if length == 126:
-        if len(data) < 4:
-            return None
-        offset = 4
-    elif length == 127:
-        if len(data) < 10:
-            return None
-        offset = 10
-    if masked:
-        if len(data) < offset + 4:
-            return None
-        mask = data[offset : offset + 4]
-        offset += 4
-        return bytes(value ^ mask[index % 4] for index, value in enumerate(data[offset:]))
-    return data[offset:]
-
-
 def nested_string(value: Any, *paths: tuple[str, ...]) -> str | None:
     for path in paths:
         current = value
@@ -354,88 +302,6 @@ def nested_string(value: Any, *paths: tuple[str, ...]) -> str | None:
     return None
 
 
-def sanitize_protocol_message(
-    message: dict[str, Any], *, last_thread_id: str | None
-) -> tuple[dict[str, Any] | None, str | None]:
-    method = message.get("method")
-    params = message.get("params")
-    params = params if isinstance(params, dict) else {}
-    thread_id = nested_string(
-        params, ("threadId",), ("thread_id",), ("thread", "id")
-    )
-    name = nested_string(params, ("name",), ("thread", "name"))
-    interesting = method in _SESSION_METHODS
-    if isinstance(method, str) and interesting:
-        sanitized: dict[str, Any] = {"method": method, "params": {}}
-        if "id" in message:
-            sanitized["id"] = message["id"]
-        if thread_id:
-            sanitized["params"]["threadId"] = thread_id
-        if name is not None and method in {"thread/name/set", "thread/name/updated"}:
-            sanitized["params"]["name"] = name
-        return sanitized, thread_id or last_thread_id
-    if "id" in message and ("result" in message or "error" in message):
-        result = message.get("result")
-        result_thread = nested_string(result, ("thread", "id"), ("threadId",))
-        result_name = nested_string(result, ("thread", "name"))
-        if result_thread:
-            sanitized = {
-                "id": message["id"],
-                "result": {"thread": {"id": result_thread}},
-            }
-            if result_name is not None:
-                sanitized["result"]["thread"]["name"] = result_name
-            result_object = result.get("thread")
-            if isinstance(result_object, dict) and result_object.get("ephemeral") is True:
-                # The TUI runs helper work such as title generation on an
-                # ephemeral thread over the same connection. It must not
-                # replace the thread that the pane is showing.
-                sanitized["result"]["thread"]["ephemeral"] = True
-                return sanitized, last_thread_id
-            return sanitized, result_thread
-        if "error" in message:
-            return {"id": message["id"], "error": {}}, last_thread_id
-    return None, last_thread_id
-
-
-def sanitize_protocol_prefix(
-    payload: bytes, *, last_thread_id: str | None
-) -> tuple[dict[str, Any] | None, str | None]:
-    method_match = _METHOD_RE.search(payload[:1024])
-    try:
-        method = method_match.group(1).decode("ascii") if method_match else None
-    except UnicodeDecodeError:
-        return None, last_thread_id
-    thread_match = _THREAD_RE.search(payload[:2048]) or _THREAD_OBJECT_RE.search(
-        payload[:2048]
-    )
-    thread_id = thread_match.group(1).decode("ascii") if thread_match else None
-    if method is None:
-        return None, last_thread_id
-    interesting = method in _SESSION_METHODS
-    if not interesting:
-        return None, last_thread_id
-    sanitized: dict[str, Any] = {"method": method, "params": {}}
-    request_id = _ID_RE.search(payload[:512])
-    if request_id:
-        try:
-            sanitized["id"] = json.loads(request_id.group(1))
-        except json.JSONDecodeError:
-            pass
-    if thread_id:
-        sanitized["params"]["threadId"] = thread_id
-    if method in {"thread/name/set", "thread/name/updated"}:
-        name_match = _NAME_RE.search(payload[:2048])
-        if name_match:
-            try:
-                sanitized["params"]["name"] = json.loads(
-                    b'"' + name_match.group(1) + b'"'
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                pass
-    return sanitized, thread_id or last_thread_id
-
-
 @dataclasses.dataclass
 class ProtocolState:
     connection: Connection
@@ -445,6 +311,14 @@ class ProtocolState:
     thread_id: str | None = None
     thread_name: str | None = None
     ephemeral_threads: set[str] = dataclasses.field(default_factory=set)
+    # A thread the client resumed while it was still on another one. The Codex
+    # TUI does that both to switch (/resume: resume the new thread, then
+    # unsubscribe the old one) and merely to look at a thread (/agent opening a
+    # sub-agent, refreshing a snapshot before replay), which leaves the pane's
+    # own thread subscribed. So the pane only moves once the client lets go of
+    # some other thread. That is the thread it was really on, which after a
+    # listener restart need not be the one remembered here.
+    switching_to: tuple[str, str | None] | None = None
 
     def consume(self, direction: str, message: dict[str, Any]) -> list[dict[str, Any]]:
         return (
@@ -469,17 +343,18 @@ class ProtocolState:
             "thread/resume",
             "thread/fork",
             "thread/name/set",
-            "thread/unsubscribe",
         }:
             self.pending[str(request_id)] = (method, thread_id, name)
         events: list[dict[str, Any]] = []
-        if method in {
-            "thread/resume",
-            "turn/start",
-            "turn/steer",
-            "thread/shellCommand",
-        } and thread_id:
+        if method in {"turn/start", "turn/steer", "thread/shellCommand"} and thread_id:
+            self.switching_to = None
             events.extend(self._bind(thread_id, None, method))
+        if method == "thread/resume" and thread_id:
+            events.extend(self._resume(thread_id, None, method))
+        if method == "thread/unsubscribe" and thread_id:
+            # Acted on as sent: the TUI moves on without waiting to see whether
+            # it worked, and so does the pane.
+            events.extend(self._unsubscribe(thread_id))
         if method == "thread/name/set" and thread_id and name is not None:
             if self.thread_id is None:
                 events.extend(self._bind(thread_id, None, method))
@@ -510,9 +385,18 @@ class ProtocolState:
         if response_id is None:
             return []
         pending = self.pending.pop(str(response_id), None)
-        if pending is None or "error" in message:
+        if pending is None:
             return []
         pending_method, pending_thread, pending_name = pending
+        if "error" in message:
+            # A /resume that failed never goes on to unsubscribe anything.
+            if (
+                pending_method == "thread/resume"
+                and self.switching_to is not None
+                and self.switching_to[0] == pending_thread
+            ):
+                self.switching_to = None
+            return []
         result = message.get("result")
         thread_id = nested_string(
             result, ("thread", "id"), ("threadId",), ("id",)
@@ -523,28 +407,38 @@ class ProtocolState:
             if isinstance(thread, dict) and thread.get("ephemeral") is True:
                 self.ephemeral_threads.add(thread_id)
                 return []
+            if pending_method == "thread/resume":
+                return self._resume(thread_id, name, f"{pending_method}:response")
+            self.switching_to = None
             return self._bind(thread_id, name, f"{pending_method}:response")
         if pending_method == "thread/name/set" and pending_thread == self.thread_id:
-            # A successful response confirms that app-server processed the rename,
-            # but some clients do not receive a thread/name/updated notification on
-            # this connection. Invalidate the old cached name so the controller's
-            # non-subscribing thread/read resolver fetches the committed value.
+            # The rename went through. thread/name/updated follows with the name as
+            # stored (trimmed), unless this client opted out of it at initialize, so
+            # drop the old name and let the controller's non-subscribing thread/read
+            # resolver fetch the committed value.
             if self.thread_name != pending_name:
                 self.thread_name = None
             return []
-        if pending_method == "thread/unsubscribe" and pending_thread == self.thread_id:
-            old_thread = self.thread_id
-            old_name = self.thread_name
-            self.thread_id = None
-            self.thread_name = None
-            return [
-                self._event(
-                    "thread.unbound",
-                    old_thread,
-                    old_name,
-                    "thread/unsubscribe:response",
-                )
-            ]
+        return []
+
+    def _unsubscribe(self, thread_id: str) -> list[dict[str, Any]]:
+        if self.switching_to is not None:
+            target, name = self.switching_to
+            self.switching_to = None
+            if target != thread_id:
+                return self._bind(target, name, "thread/resume+unsubscribe")
+        if thread_id != self.thread_id:
+            return []
+        old_thread, old_name = self.thread_id, self.thread_name
+        self.thread_id = None
+        self.thread_name = None
+        return [self._event("thread.unbound", old_thread, old_name, "thread/unsubscribe")]
+
+    def _resume(self, thread_id: str, name: str | None, reason: str) -> list[dict[str, Any]]:
+        if self.thread_id is None or self.thread_id == thread_id:
+            return self._bind(thread_id, name, reason)
+        if thread_id not in self.ephemeral_threads:
+            self.switching_to = (thread_id, name)
         return []
 
     def _bind(self, thread_id: str, name: str | None, reason: str) -> list[dict[str, Any]]:

@@ -1,0 +1,24 @@
+[package]
+name = "codex-session-capture"
+version = "0.1.0"
+edition = "2021"
+description = "Privileged, metadata-only eBPF capture helper for codex-session-listener."
+
+# No dependencies on purpose. This binary is started as root, so everything it
+# runs is in this crate, in std, or in the system's libbpf. The handful of libc
+# calls are declared directly in src/sys.rs.
+[dependencies]
+
+[lib]
+name = "session_capture"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codex-session-capture"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+strip = true

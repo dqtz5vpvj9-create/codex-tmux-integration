@@ -30,8 +30,5 @@ from .protocol import (  # noqa: F401
     WebSocketDecoder,
     decode_json_message,
     connection_event,
-    sanitize_protocol_message,
-    sanitize_protocol_prefix,
     websocket_frame,
-    websocket_payload_prefix,
 )

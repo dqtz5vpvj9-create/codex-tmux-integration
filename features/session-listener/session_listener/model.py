@@ -31,13 +31,17 @@ def utc_now() -> str:
 
 
 def process_start_ticks(pid: int) -> int | None:
-    """Return Linux /proc start ticks, guarding against PID reuse."""
+    """Return Linux /proc start ticks, guarding against PID reuse.
+
+    Every reader here takes any OSError as "no such process": one that exits
+    between open() and read() fails the read with ESRCH, not ENOENT.
+    """
 
     try:
         value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         suffix = value[value.rfind(")") + 2 :].split()
         return int(suffix[19])
-    except (FileNotFoundError, PermissionError, IndexError, ValueError):
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -48,7 +52,7 @@ def process_parent_pid(pid: int) -> int | None:
         value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         suffix = value[value.rfind(")") + 2 :].split()
         return int(suffix[1])
-    except (FileNotFoundError, PermissionError, IndexError, ValueError):
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -82,7 +86,7 @@ def process_fd_socket_inode(pid: int, fd: int) -> int | None:
 def read_process_environment(pid: int) -> dict[str, str]:
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
-    except (FileNotFoundError, PermissionError):
+    except OSError:
         return {}
     result: dict[str, str] = {}
     for item in raw.split(b"\0"):
@@ -96,7 +100,7 @@ def read_process_environment(pid: int) -> dict[str, str]:
 def read_process_command(pid: int) -> list[str]:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except (FileNotFoundError, PermissionError):
+    except OSError:
         return []
     return [item.decode(errors="replace") for item in raw.split(b"\0") if item]
 

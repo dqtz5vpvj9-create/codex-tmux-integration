@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
-import ctypes
 import io
 import json
 import os
 import struct
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -311,13 +311,13 @@ def test_background_notification_cannot_replace_active_thread() -> None:
     assert state.thread_id == "thread-active"
 
 
-def test_successful_unsubscribe_clears_active_thread() -> None:
+def test_unsubscribe_clears_active_thread() -> None:
     state = listener.ProtocolState(connection())
     state.consume(
         "client_to_server",
         {"method": "turn/start", "id": 1, "params": {"threadId": "thread-active"}},
     )
-    state.consume(
+    events = state.consume(
         "client_to_server",
         {
             "method": "thread/unsubscribe",
@@ -325,7 +325,6 @@ def test_successful_unsubscribe_clears_active_thread() -> None:
             "params": {"threadId": "thread-active"},
         },
     )
-    events = state.consume("server_to_client", {"id": 2, "result": {}})
     assert events[0]["event"] == "thread.unbound"
     assert state.thread_id is None
 
@@ -349,7 +348,7 @@ def test_codex_tui_filter_excludes_app_server(monkeypatch: pytest.MonkeyPatch) -
 def test_resume_process_supplies_only_explicit_thread_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    thread_id = "019fef92-949e-77a1-a9e2-2c54da07cceb"
+    thread_id = "019f0000-0000-7000-8000-000000000002"
     monkeypatch.setattr(
         model,
         "read_process_command",
@@ -381,62 +380,6 @@ def test_app_server_filter_requires_native_codex(monkeypatch: pytest.MonkeyPatch
     assert not listener.is_codex_tui_process(10)
 
 
-def test_sanitizer_drops_content_notification_entirely() -> None:
-    sanitized, latest = listener.sanitize_protocol_message(
-        {
-            "method": "item/agentMessage/delta",
-            "params": {"threadId": "thread-12345678", "delta": "private"},
-        },
-        last_thread_id=None,
-    )
-    assert latest is None
-    assert sanitized is None
-
-
-def test_sanitizer_ignores_repeated_content_notification() -> None:
-    sanitized, latest = listener.sanitize_protocol_message(
-        {
-            "method": "item/agentMessage/delta",
-            "params": {"threadId": "thread-12345678", "delta": "private"},
-        },
-        last_thread_id="thread-12345678",
-    )
-    assert sanitized is None
-    assert latest == "thread-12345678"
-
-
-def test_sanitizer_keeps_active_thread_token_usage() -> None:
-    sanitized, latest = listener.sanitize_protocol_message(
-        {
-            "method": "thread/tokenUsage/updated",
-            "params": {"threadId": "thread-12345678", "tokenUsage": {"secret": 1}},
-        },
-        last_thread_id=None,
-    )
-    assert latest == "thread-12345678"
-    assert sanitized == {
-        "method": "thread/tokenUsage/updated",
-        "params": {"threadId": "thread-12345678"},
-    }
-
-
-def test_partial_masked_frame_extracts_thread_before_large_content() -> None:
-    payload = (
-        b'{"method":"turn/start","id":9,"params":'
-        b'{"threadId":"thread-12345678","input":"' + b"x" * 8000
-    )
-    frame = make_websocket_frame(payload, masked=True)
-    prefix = listener.websocket_payload_prefix(frame[:4096], masked=True)
-    assert prefix is not None
-    sanitized, latest = listener.sanitize_protocol_prefix(prefix, last_thread_id=None)
-    assert latest == "thread-12345678"
-    assert sanitized == {
-        "method": "turn/start",
-        "id": 9,
-        "params": {"threadId": "thread-12345678"},
-    }
-
-
 def test_registry_file_is_atomic_private_metadata(tmp_path: Path) -> None:
     state_file = tmp_path / "state/sessions.json"
     stream = io.StringIO()
@@ -457,7 +400,7 @@ def test_protocol_event_records_client_kind() -> None:
 
 
 def test_opening_events_publish_explicit_resume_hint_without_name() -> None:
-    thread_id = "019ff05a-6556-7a90-b2d9-23a4351217f7"
+    thread_id = "019f0000-0000-7000-8000-000000000003"
     resumed = dataclasses.replace(connection(), thread_hint=thread_id)
     state = listener.ProtocolState(resumed, thread_id=thread_id)
 
@@ -686,11 +629,67 @@ def test_title_sync_consumer_uses_registry_mode(
     ]
 
 
+def test_a_failed_title_sync_is_reported_not_fatal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outcomes = [
+        SimpleNamespace(returncode=1, stderr="tmux: no server"),
+        cli.subprocess.TimeoutExpired("title-sync", 3.0),
+    ]
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    consumer = cli.TitleSyncConsumer(Path("/tmp/title-sync"))
+    consumer(tmp_path / "sessions.json")
+    consumer(tmp_path / "sessions.json")
+    assert capsys.readouterr().err.count("tmux title sync failed") == 2
+
+
+def test_process_events_do_not_run_the_title_sync(tmp_path: Path) -> None:
+    calls: list[Path] = []
+    registry = cli.RegistryOutput(io.StringIO(), tmp_path / "sessions.json", calls.append)
+    calls.clear()
+    cli.encode_event(
+        registry,
+        {"schema": listener.SCHEMA, "event": "process.started", "process": {"pid": 5, "comm": "codex"}},
+    )
+    assert calls == []
+    cli.encode_event(registry, listener.connection_event("connection.opened", connection()))
+    assert calls == [tmp_path / "sessions.json"]
+
+
 def test_untrusted_user_writable_helper_is_rejected(tmp_path: Path) -> None:
-    helper = tmp_path / "codex_session_listener.py"
-    helper.write_text("pass\n")
-    with pytest.raises(listener.ListenerError):
+    helper = tmp_path / "codex-session-capture"
+    helper.write_bytes(b"\x7fELF")
+    (tmp_path / "bpf").mkdir()
+    (tmp_path / "bpf" / "codex_session_capture.bpf.o").write_bytes(b"\x7fELF")
+    with pytest.raises(listener.ListenerError, match="root-owned"):
         cli.validate_privileged_helper(helper)
+
+
+def test_missing_helper_names_the_install_step(tmp_path: Path) -> None:
+    with pytest.raises(listener.ListenerError, match="install-codex-session-listener-helper"):
+        cli.validate_privileged_helper(tmp_path / "codex-session-capture")
+
+
+def test_helper_is_started_directly_through_sudo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "validate_privileged_helper", lambda helper: helper)
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 1000)
+    assert cli.helper_command(cli.TRUSTED_HELPER, Path("/run/control.sock")) == [
+        "/usr/bin/sudo",
+        "-n",
+        "--",
+        "/usr/libexec/codex-session-listener/current/codex-session-capture",
+        "--control-socket",
+        "/run/control.sock",
+    ]
 
 
 def test_bpf_object_compiles() -> None:
@@ -699,10 +698,6 @@ def test_bpf_object_compiles() -> None:
         assert object_path.stat().st_size > 0
     finally:
         temporary.cleanup()
-
-
-def test_capture_event_layout_matches_bpf_structure() -> None:
-    assert ctypes.sizeof(capture.CaptureEvent) == 4136
 
 
 def test_controller_waits_through_app_server_restart(
@@ -732,17 +727,9 @@ def test_ephemeral_side_thread_does_not_replace_pane_thread() -> None:
         "client_to_server",
         {"method": "turn/start", "id": 1, "params": {"threadId": "thread-main"}},
     )
-    sanitized, latest = listener.sanitize_protocol_message(
-        {
-            "id": 2,
-            "result": {
-                "thread": {"id": "thread-title", "ephemeral": True, "preview": "x"}
-            },
-        },
-        last_thread_id="thread-main",
-    )
-    assert latest == "thread-main"
-    assert sanitized == {
+    # What the capture helper publishes for the response that opens the side
+    # thread; helper-rs has the matching test for how it gets there.
+    sanitized = {
         "id": 2,
         "result": {"thread": {"id": "thread-title", "ephemeral": True}},
     }
@@ -759,7 +746,7 @@ def test_ephemeral_side_thread_does_not_replace_pane_thread() -> None:
     assert state.thread_id == "thread-main"
 
 
-def test_switching_threads_drops_the_previous_name() -> None:
+def started_on(thread_id: str, name: str | None) -> listener.ProtocolState:
     state = listener.ProtocolState(connection())
     state.consume(
         "client_to_server",
@@ -767,10 +754,362 @@ def test_switching_threads_drops_the_previous_name() -> None:
     )
     state.consume(
         "server_to_client",
-        {"id": 1, "result": {"thread": {"id": "thread-one", "name": "first"}}},
+        {"id": 1, "result": {"thread": {"id": thread_id, "name": name}}},
     )
+    return state
+
+
+def resume(state: listener.ProtocolState, request_id: int, thread_id: str, name: str | None):
     events = state.consume(
         "client_to_server",
-        {"method": "thread/resume", "id": 2, "params": {"threadId": "thread-two"}},
+        {"method": "thread/resume", "id": request_id, "params": {"threadId": thread_id}},
     )
+    # What the capture helper forwards of a ThreadResumeResponse.
+    return events + state.consume(
+        "server_to_client",
+        {"id": request_id, "result": {"thread": {"id": thread_id, "name": name}}},
+    )
+
+
+def unsubscribe(state: listener.ProtocolState, request_id: int, thread_id: str):
+    events = state.consume(
+        "client_to_server",
+        {"method": "thread/unsubscribe", "id": request_id, "params": {"threadId": thread_id}},
+    )
+    # What the capture helper forwards of the {status} answer; the switch has
+    # already happened by then.
+    return events + state.consume("server_to_client", {"id": request_id, "result": {}})
+
+
+def test_switching_threads_drops_the_previous_name() -> None:
+    # What /resume sends: the new thread first, then the old one goes.
+    state = started_on("thread-one", "first")
+    assert resume(state, 2, "thread-two", None) == []
+    events = unsubscribe(state, 3, "thread-one")
+    assert events[0]["event"] == "thread.bound"
     assert events[0]["thread"] == {"id": "thread-two", "name": None}
+    assert events[0]["source"] == "thread/resume+unsubscribe"
+
+
+def test_switching_threads_carries_the_name_the_resume_returned() -> None:
+    state = started_on("thread-one", "first")
+    resume(state, 2, "thread-two", "second")
+    events = unsubscribe(state, 3, "thread-one")
+    assert events[0]["thread"] == {"id": "thread-two", "name": "second"}
+
+
+def test_looking_at_another_thread_keeps_the_pane_on_its_own() -> None:
+    # /agent opening a sub-agent, or any thread the TUI resumes only to show it,
+    # never unsubscribes the pane's thread. A pane once showed an unrelated
+    # session's name for hours this way.
+    state = started_on("thread-main", "ContentionModel")
+    for request_id, other in enumerate(["sub-agent-1", "sub-agent-2", "someone-else"], 2):
+        assert resume(state, request_id, other, None) == []
+    assert (state.thread_id, state.thread_name) == ("thread-main", "ContentionModel")
+
+
+def test_typing_into_the_looked_at_thread_moves_the_pane_there() -> None:
+    state = started_on("thread-main", "main")
+    resume(state, 2, "sub-agent", "helper")
+    events = state.consume(
+        "client_to_server",
+        {"method": "turn/start", "id": 3, "params": {"threadId": "sub-agent"}},
+    )
+    assert events[0]["thread"]["id"] == "sub-agent"
+
+
+def test_a_look_that_ended_does_not_hijack_a_later_unsubscribe() -> None:
+    state = started_on("thread-main", "main")
+    resume(state, 2, "sub-agent", None)
+    state.consume(
+        "client_to_server",
+        {"method": "turn/start", "id": 3, "params": {"threadId": "thread-main"}},
+    )
+    events = unsubscribe(state, 4, "thread-main")
+    assert events[0]["event"] == "thread.unbound"
+
+
+def test_switching_does_not_depend_on_knowing_the_thread_the_pane_was_on() -> None:
+    # After a restart the listener may believe the pane is on an older thread;
+    # /resume still lets go of whatever thread the TUI was really on.
+    state = listener.ProtocolState(connection(), thread_id="thread-remembered")
+    resume(state, 1, "thread-new", "new")
+    events = unsubscribe(state, 2, "thread-actually-shown")
+    assert events[0]["thread"] == {"id": "thread-new", "name": "new"}
+
+
+def test_dropping_the_looked_at_thread_ends_the_switch() -> None:
+    state = started_on("thread-main", "main")
+    resume(state, 2, "sub-agent", None)
+    assert unsubscribe(state, 3, "sub-agent") == []
+    assert state.switching_to is None
+    assert state.thread_id == "thread-main"
+
+
+def test_a_failed_resume_ends_the_switch() -> None:
+    state = started_on("thread-main", "main")
+    state.consume(
+        "client_to_server",
+        {"method": "thread/resume", "id": 2, "params": {"threadId": "gone"}},
+    )
+    assert state.consume("server_to_client", {"id": 2, "error": {}}) == []
+    assert state.switching_to is None
+
+
+def test_resume_on_an_unbound_connection_binds_at_once() -> None:
+    state = listener.ProtocolState(connection())
+    events = resume(state, 1, "thread-one", "first")
+    assert [item["thread"] for item in events] == [
+        {"id": "thread-one", "name": None},
+        {"id": "thread-one", "name": "first"},
+    ]
+
+
+def test_bindings_outlive_the_registry_reset(tmp_path: Path) -> None:
+    state_file = tmp_path / "sessions.json"
+    registry = cli.RegistryOutput(io.StringIO(), state_file)
+    state = listener.ProtocolState(connection())
+    cli.encode_event(registry, state._event("thread.bound", "thread-1", None, "test"))
+
+    registry.reset()
+
+    assert json.loads(state_file.read_text())["connections"] == {}
+    restarted = cli.RegistryOutput(io.StringIO(), state_file)
+    assert restarted.remembered == {connection().key: "thread-1"}
+
+
+def test_opening_events_reattach_a_remembered_thread() -> None:
+    state = listener.ProtocolState(connection(), thread_id="thread-1")
+
+    events = cli.opening_events(state, "thread-1")
+
+    assert events[1]["event"] == "thread.bound"
+    assert events[1]["thread"] == {"id": "thread-1", "name": None}
+    assert events[1]["source"] == "registry:remembered"
+
+
+def test_remembered_thread_wins_over_the_resume_argument() -> None:
+    # The key covers the resume argument, so the remembered thread was seen on
+    # this very process afterwards: `codex resume A`, then /resume B.
+    thread_id = "019f0000-0000-7000-8000-000000000003"
+    resumed = dataclasses.replace(connection(), thread_hint=thread_id)
+    state = listener.ProtocolState(resumed, thread_id="thread-1")
+
+    events = cli.opening_events(state, "thread-1")
+
+    assert [event["source"] for event in events[1:]] == ["registry:remembered"]
+    assert events[1]["thread"]["id"] == "thread-1"
+
+
+def test_a_restart_inside_the_process_starts_from_the_latest_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "sessions.json"
+    key = connection().key
+    state_file.with_name("sessions.json.bindings").write_text(
+        json.dumps({"schema": "codex.session-bindings.v1", "bindings": {key: "thread-old"}})
+    )
+    handed: list[dict[str, str]] = []
+
+    def fake_listen(_socket: Path, output: cli.RegistryOutput, _helper: Path, remembered):
+        handed.append(dict(remembered))
+        if len(handed) == 1:
+            state = listener.ProtocolState(connection())
+            cli.encode_event(output, state._event("thread.bound", "thread-new", None, "turn/start"))
+            return 75
+        return 0
+
+    monkeypatch.setattr(cli, "listen", fake_listen)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli.sys, "stdout", io.StringIO())
+    assert cli.main(["--state-file", str(state_file), "--no-title-sync"]) == 0
+    assert handed == [{key: "thread-old"}, {key: "thread-new"}]
+
+
+def test_registry_lists_agent_processes_the_helper_saw_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "process_start_ticks", lambda pid: 4242)
+    state_file = tmp_path / "sessions.json"
+    registry = cli.RegistryOutput(io.StringIO(), state_file)
+
+    started = cli.process_event({"kind": "process", "event": "exec", "pid": 77, "comm": "claude"})
+    assert started is not None
+    cli.encode_event(registry, started)
+    assert json.loads(state_file.read_text())["processes"] == {
+        "77": {"pid": 77, "start_ticks": 4242, "comm": "claude"}
+    }
+
+    exited = cli.process_event({"kind": "process", "event": "exit", "pid": 77, "comm": "claude"})
+    assert exited is not None
+    cli.encode_event(registry, exited)
+    current = json.loads(state_file.read_text())
+    assert current["processes"] == {} and current["connections"] == {}
+
+
+def test_malformed_process_records_are_ignored() -> None:
+    assert cli.process_event({"kind": "process", "event": "fork", "pid": 1}) is None
+    assert cli.process_event({"kind": "process", "event": "exec", "pid": "1"}) is None
+
+
+class FakeHelper:
+    """A capture helper whose output is written in stages as the controller runs.
+
+    ``stages`` pairs a condition on the events published so far with the
+    records to send once it holds; the helper exits when they are all sent and
+    ``done`` holds, or after a few seconds.
+    """
+
+    def __init__(self, published: io.StringIO, stages, done):
+        read_out, self.write_out = os.pipe()
+        read_err, write_err = os.pipe()
+        os.close(write_err)
+        self.stdout = os.fdopen(read_out, "rb", buffering=0)
+        self.stderr = os.fdopen(read_err, "rb", buffering=0)
+        self.published, self.stages, self.done = published, list(stages), done
+        self.deadline = time.monotonic() + 5
+        self.returncode: int | None = None
+
+    def events(self) -> list[dict]:
+        return [json.loads(line) for line in self.published.getvalue().splitlines()]
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        if self.stages and self.stages[0][0](self.events()):
+            _, records = self.stages.pop(0)
+            for record in records:
+                os.write(self.write_out, (json.dumps({"schema": model.CAPTURE_SCHEMA, **record}) + "\n").encode())
+        if (not self.stages and self.done(self.events())) or time.monotonic() > self.deadline:
+            os.close(self.write_out)
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def discovery(*connections) -> model.Discovery:
+    return model.Discovery(
+        server_pid=10,
+        server_start_ticks=100,
+        listener_fd=3,
+        listener_inode=30,
+        connections={item.server_fd: item for item in connections},
+    )
+
+
+def run_listener(monkeypatch, discoveries, remembered, stages, done, names):
+    published = io.StringIO()
+    helpers: list[FakeHelper] = []
+    found = list(discoveries)
+    monkeypatch.setattr(cli, "helper_command", lambda *_args: ["capture-helper"])
+    monkeypatch.setattr(cli, "discover", lambda _socket: found.pop(0) if len(found) > 1 else found[0])
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: helpers.append(FakeHelper(published, stages, done)) or helpers[-1],
+    )
+    monkeypatch.setattr(
+        cli, "ThreadNameResolver", lambda _socket: SimpleNamespace(resolve=lambda thread: names.get(thread))
+    )
+    assert cli.listen(Path("/tmp/control.sock"), published, remembered=remembered) == 0
+    return helpers[0].events()
+
+
+def protocol(direction: str, message: dict) -> dict:
+    return {"kind": "protocol", "fd": connection().server_fd, "direction": direction, "message": message}
+
+
+def test_a_rename_is_read_back_instead_of_the_cached_old_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A client that opted out of thread/name/updated only gets the bare answer.
+    names = {"thread-active": "old name"}
+
+    def resolved(name):
+        return lambda events: any(
+            event["event"] == "thread.name.resolved" and event["thread"]["name"] == name
+            for event in events
+        )
+
+    def commit_rename():
+        names["thread-active"] = "new name"
+        return [
+            protocol(
+                "client_to_server",
+                {"method": "thread/name/set", "id": 4, "params": {"threadId": "thread-active", "name": "new name"}},
+            ),
+            protocol("server_to_client", {"id": 4, "result": {}}),
+        ]
+
+    class Rename(list):
+        def __iter__(self):
+            return iter(commit_rename())
+
+    events = run_listener(
+        monkeypatch,
+        [discovery(connection())],
+        {connection().key: "thread-active"},
+        [(resolved("old name"), Rename())],
+        resolved("new name"),
+        names,
+    )
+    shown = [event["thread"]["name"] for event in events if event["event"] == "thread.name.resolved"]
+    assert shown == ["old name", "new name"]
+
+
+def test_a_connection_found_later_gets_its_remembered_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The first discovery saw nothing (say tmux did not answer in time).
+    def bound(events):
+        return any(event["event"] == "thread.bound" for event in events)
+
+    events = run_listener(
+        monkeypatch,
+        [discovery(), discovery(connection())],
+        {connection().key: "thread-remembered"},
+        [(lambda _events: True, [{"kind": "topology"}])],
+        bound,
+        {},
+    )
+    bound_events = [event for event in events if event["event"] == "thread.bound"]
+    assert [(event["thread"]["id"], event["source"]) for event in bound_events] == [
+        ("thread-remembered", "registry:remembered")
+    ]
+
+
+def test_a_second_connection_of_a_resumed_tui_is_not_given_the_resume_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = dataclasses.replace(connection(), thread_hint="thread-started-on")
+    second = dataclasses.replace(first, server_fd=9, server_inode=90, client_fd=12, client_inode=120)
+
+    def opened_twice(events):
+        return sum(event["event"] == "connection.opened" for event in events) == 2
+
+    events = run_listener(
+        monkeypatch,
+        [discovery(first), discovery(first, second)],
+        {first.key: "thread-switched-to"},
+        [(lambda _events: True, [{"kind": "topology"}])],
+        opened_twice,
+        {},
+    )
+    bound = [(event["client"]["fd"], event["thread"]["id"]) for event in events if event["event"] == "thread.bound"]
+    assert bound == [(first.client_fd, "thread-switched-to")]
+
+
+def test_a_process_exiting_while_it_is_read_counts_as_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    # /proc/PID/stat still opens, then the read fails with ESRCH; this ended the
+    # service once when an agent exited at that moment.
+    def vanished(*_args: object, **_kwargs: object) -> object:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(model.Path, "read_text", vanished)
+    monkeypatch.setattr(model.Path, "read_bytes", vanished)
+    assert model.process_start_ticks(123) is None
+    assert model.process_parent_pid(123) is None
+    assert model.read_process_environment(123) == {}
+    assert model.read_process_command(123) == []
+    assert cli.process_event({"event": "exit", "pid": 123, "comm": "codex"})["process"]["start_ticks"] is None

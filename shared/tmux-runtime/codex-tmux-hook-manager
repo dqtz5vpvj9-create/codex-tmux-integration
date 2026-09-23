@@ -162,6 +162,34 @@ FEATURE_HOOKS: dict[str, tuple[tuple[str, str], ...]] = {
                 background=False,
             ),
         ),
+        # switch-client, and therefore choose-tree and any picker built on it,
+        # changes the window without running select-window or select-pane.
+        (
+            "session-window-changed",
+            _run_shell(
+                "window-attention",
+                "agent-tmux-notify",
+                "--clear-window",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+                background=False,
+            ),
+        ),
+        (
+            "client-session-changed",
+            _run_shell(
+                "window-attention",
+                "agent-tmux-notify",
+                "--clear-window",
+                "--socket",
+                "#{q:socket_path}",
+                "--window",
+                "#{window_id}",
+                background=False,
+            ),
+        ),
     ),
     "pane-logging": (
         (

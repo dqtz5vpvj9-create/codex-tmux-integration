@@ -31,7 +31,7 @@ MANAGED_EXECUTABLES = {
 }
 TMUX_HOOK_COUNTS = {
     "title-sync": 6,
-    "window-attention": 4,
+    "window-attention": 6,
     "pane-logging": 5,
 }
 

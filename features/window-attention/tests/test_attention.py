@@ -172,12 +172,15 @@ def test_hook_repairs_clear_hooks_before_marking(monkeypatch):
     monkeypatch.setattr(
         notify,
         "mark_window",
-        lambda socket, window, style: calls.append(("mark", socket, window, style)) or True,
+        lambda socket, window, style, pane, kind: calls.append(
+            ("mark", socket, window, style, pane, kind)
+        )
+        or True,
     )
     assert notify.mark_from_hook({"hook_event_name": "Stop"})
     assert calls == [
         ("ensure", "/tmp/server"),
-        ("mark", "/tmp/server", "@1", notify.DEFAULT_STYLE),
+        ("mark", "/tmp/server", "@1", notify.DEFAULT_STYLE, "%1", "done"),
     ]
 
 
@@ -199,3 +202,69 @@ def test_hook_fails_closed_when_clear_hooks_cannot_be_repaired(monkeypatch):
         lambda *args: (_ for _ in ()).throw(AssertionError("unexpected highlight")),
     )
     assert not notify.mark_from_hook({"hook_event_name": "Stop"})
+
+
+def test_waiting_events_are_told_apart_from_finished_turns():
+    assert notify.attention_kind({"hook_event_name": "Stop"}) == "done"
+    assert notify.attention_kind({"hook_event_name": "Notification"}) == "input"
+    assert notify.attention_kind({"hook_event_name": "PermissionRequest"}) == "input"
+
+
+def _mark_with(monkeypatch, tmp_path, viewers, in_view):
+    marked, styled = [], []
+    monkeypatch.setattr(notify, "STATE_ROOT", tmp_path)
+    monkeypatch.setattr(notify, "current_server_pid", lambda socket: 1)
+    monkeypatch.setattr(notify, "window_lock", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(notify, "active_clients", lambda socket, window: viewers)
+    monkeypatch.setattr(notify, "pane_in_view", lambda socket, pane: in_view)
+    monkeypatch.setattr(notify, "current_style", lambda socket, window: ("default", False))
+    monkeypatch.setattr(
+        notify, "set_pane_attention", lambda socket, pane, kind: marked.append((pane, kind))
+    )
+    monkeypatch.setattr(
+        notify, "set_style", lambda socket, window, value: styled.append(value) or True
+    )
+    result = notify.mark_window("/tmp/server", "@1", "attention", "%7", "input")
+    return result, marked, styled
+
+
+def test_unwatched_pane_is_marked_along_with_its_window(monkeypatch, tmp_path):
+    assert _mark_with(monkeypatch, tmp_path, viewers=0, in_view=True) == (
+        True,
+        [("%7", "input")],
+        ["attention"],
+    )
+
+
+def test_pane_on_screen_is_not_marked(monkeypatch, tmp_path):
+    assert _mark_with(monkeypatch, tmp_path, viewers=1, in_view=True) == (False, [], [])
+
+
+def test_pane_hidden_by_zoom_is_marked_without_a_window_highlight(monkeypatch, tmp_path):
+    assert _mark_with(monkeypatch, tmp_path, viewers=1, in_view=False) == (
+        False,
+        [("%7", "input")],
+        [],
+    )
+
+
+def _clear_with(monkeypatch, listing):
+    unset = []
+    monkeypatch.setattr(notify, "tmux", lambda *args: listing)
+    monkeypatch.setattr(
+        notify,
+        "tmux_result",
+        lambda socket, *args: unset.append(args[4]) if args[0] == "set-option" else None,
+    )
+    notify.clear_pane_attention("/tmp/server", "@1")
+    return unset
+
+
+def test_focus_clears_every_marked_pane_of_an_unzoomed_window(monkeypatch):
+    listing = "%1 1 0 \n%2 0 0 done:10\n%3 0 0 input:11"
+    assert _clear_with(monkeypatch, listing) == ["%2", "%3"]
+
+
+def test_focus_on_a_zoomed_window_clears_only_the_pane_in_view(monkeypatch):
+    listing = "%1 1 1 done:9\n%2 0 1 input:11"
+    assert _clear_with(monkeypatch, listing) == ["%1"]

@@ -28,6 +28,12 @@ TMUX_TIMEOUT_SECONDS = 1.0
 CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
 STATE_ROOT = CACHE_HOME / "codex-tmux-integration" / "window-attention"
 DEFAULT_STYLE = "fg=black,bg=#d7af00,bold"
+# Pane-level marker for consumers that list agents per pane. The value is
+# ``input:<unix time>`` when the agent waits on the user and ``done:<unix time>``
+# when a turn finished; tmux drops it together with the pane.
+PANE_ATTENTION_OPTION = "@agent_attention"
+INPUT_EVENTS = frozenset({"Notification", "PermissionRequest"})
+ATTENTION_CHANNEL = "agent-attention"
 HOOK_MANAGER = Path.home() / ".local" / "bin" / "codex-tmux-hook-manager"
 
 
@@ -92,6 +98,53 @@ def active_clients(socket: str, window: str) -> int:
         ),
         0,
     )
+
+
+def attention_kind(payload: dict[str, Any]) -> str:
+    return "input" if clean(payload.get("hook_event_name")) in INPUT_EVENTS else "done"
+
+
+def pane_in_view(socket: str, pane: str) -> bool:
+    """Whether a client looking at the pane's window can see the pane itself."""
+
+    zoomed, _, active = tmux(
+        socket, "display-message", "-p", "-t", pane, "#{window_zoomed_flag} #{pane_active}"
+    ).partition(" ")
+    return zoomed != "1" or active == "1"
+
+
+def announce_attention(socket: str) -> None:
+    # Wakes anything blocked in ``tmux wait-for agent-attention``; a signal
+    # sent while nobody waits is kept for the next waiter.
+    tmux_result(socket, "wait-for", "-S", ATTENTION_CHANNEL)
+
+
+def set_pane_attention(socket: str, pane: str, kind: str) -> None:
+    tmux_result(
+        socket, "set-option", "-p", "-t", pane, PANE_ATTENTION_OPTION, f"{kind}:{int(time.time())}"
+    )
+    announce_attention(socket)
+
+
+def clear_pane_attention(socket: str, window: str) -> None:
+    """Drop the marker from every pane a viewer of this window can now see."""
+
+    listing = tmux(
+        socket,
+        "list-panes",
+        "-t",
+        window,
+        "-F",
+        f"#{{pane_id}} #{{pane_active}} #{{window_zoomed_flag}} #{{{PANE_ATTENTION_OPTION}}}",
+    )
+    cleared = False
+    for line in listing.splitlines():
+        pane, active, zoomed, *marker = line.split(" ")
+        if marker and marker[0] and (zoomed != "1" or active == "1"):
+            tmux_result(socket, "set-option", "-p", "-u", "-t", pane, PANE_ATTENTION_OPTION)
+            cleared = True
+    if cleared:
+        announce_attention(socket)
 
 
 def current_style(socket: str, window: str) -> tuple[str, bool]:
@@ -210,15 +263,23 @@ def clear_window(socket: str, window: str) -> bool:
     if server_pid <= 0 or not window:
         return False
     with window_lock(socket, server_pid, window):
+        clear_pane_attention(socket, window)
         return _restore_locked(socket, server_pid, window)
 
 
-def mark_window(socket: str, window: str, style: str) -> bool:
+def mark_window(
+    socket: str, window: str, style: str, pane: str = "", kind: str = "done"
+) -> bool:
     server_pid = current_server_pid(socket)
     if server_pid <= 0 or not window:
         return False
     with window_lock(socket, server_pid, window):
-        if active_clients(socket, window) > 0:
+        viewers = active_clients(socket, window)
+        # A zoomed window hides every pane but the active one, so its viewer
+        # has not seen this pane even though the window itself stays unmarked.
+        if pane and not (viewers > 0 and pane_in_view(socket, pane)):
+            set_pane_attention(socket, pane, kind)
+        if viewers > 0:
             _restore_locked(socket, server_pid, window)
             return False
         path = state_path(socket, server_pid, window)
@@ -256,6 +317,13 @@ def cleanup_server(socket: str) -> int:
         if window:
             with window_lock(socket, server_pid, window):
                 restored += int(_restore_locked(socket, server_pid, window))
+    marked = tmux(
+        socket, "list-panes", "-a", "-F", f"#{{pane_id}} #{{{PANE_ATTENTION_OPTION}}}"
+    )
+    for line in marked.splitlines():
+        pane, _, marker = line.partition(" ")
+        if marker:
+            tmux_result(socket, "set-option", "-p", "-u", "-t", pane, PANE_ATTENTION_OPTION)
     shutil.rmtree(root, ignore_errors=True)
     return restored
 
@@ -304,7 +372,7 @@ def mark_from_hook(payload: dict[str, Any]) -> bool:
     if not window or not ensure_clear_hooks(socket):
         return False
     style = os.environ.get("AGENT_TMUX_NOTIFY_STYLE", DEFAULT_STYLE)
-    return mark_window(socket, window, style)
+    return mark_window(socket, window, style, pane, attention_kind(payload))
 
 
 def build_parser() -> argparse.ArgumentParser:

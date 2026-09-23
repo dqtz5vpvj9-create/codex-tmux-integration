@@ -212,8 +212,10 @@ printf '%s' "$notify_payload" | \
   TMUX="$socket_path,$server_pid,0" TMUX_PANE="$pane_agent" \
   "$HOME/.local/bin/agent-tmux-notify"
 wait_for_value "tmux -S '$socket_path' show-window-options -v -t '$window' window-status-style" 'fg=black,bg=#d7af00,bold'
+# after-select-window, after-select-pane, client-attached, client-focus-in, and
+# session-window-changed and client-session-changed for switch-client.
 [[ $("$HOME/.local/bin/codex-tmux-hook-manager" \
-  list-owned window-attention --socket "$socket_path" | wc -l) -eq 4 ]]
+  list-owned window-attention --socket "$socket_path" | wc -l) -eq 6 ]]
 tmux -S "$socket_path" select-window -t "$window"
 wait_for_value "tmux -S '$socket_path' show-window-options -v -t '$window' window-status-style" 'fg=blue'
 
